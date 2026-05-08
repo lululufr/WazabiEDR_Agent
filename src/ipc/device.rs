@@ -14,6 +14,7 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 use crate::ipc::parser::parse_and_print;
 use crate::shutdown::SHUTDOWN;
+use crate::spool::SpoolHandle;
 use crate::util::strings::to_wide_nul;
 
 /// IOCTL code — must match the driver. See
@@ -45,9 +46,15 @@ pub fn open_device() -> HANDLE {
     }
 }
 
-/// Pump loop: blocking IOCTL → parse → print, until `SHUTDOWN` is set or a
-/// fatal error is returned by the driver.
-pub fn run_pump_loop(handle: HANDLE) {
+/// Pump loop: blocking IOCTL → spool + parse → print, until `SHUTDOWN`
+/// is set or a fatal error is returned by the driver.
+///
+/// `spool` is optional so the agent still works (printing only) if the
+/// spool subsystem failed to initialise. When provided, every received
+/// event is forwarded to the writer thread *before* parsing — that way
+/// a parse error (unknown event type, schema mismatch) doesn't cost us
+/// the persisted copy of the raw bytes.
+pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>) {
     let mut buf = vec![0u8; INITIAL_BUF];
 
     while !SHUTDOWN.load(Ordering::Acquire) {
@@ -89,7 +96,17 @@ pub fn run_pump_loop(handle: HANDLE) {
             break;
         }
 
-        if let Err(e) = parse_and_print(&buf[..returned as usize]) {
+        let payload = &buf[..returned as usize];
+
+        // Persist BEFORE parsing: if `parse_and_print` rejects the event
+        // (unknown version, etc.) we still want the raw bytes preserved
+        // for offline analysis. The submission is non-blocking — full
+        // channel = drop, accounted in the spool stats.
+        if let Some(spool) = spool {
+            let _ = spool.try_submit(payload.to_vec());
+        }
+
+        if let Err(e) = parse_and_print(payload) {
             eprintln!("[agent] parse error: {}", e);
         }
         io::stdout().flush().ok();
