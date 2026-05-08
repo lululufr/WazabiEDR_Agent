@@ -12,3 +12,6 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Time",
     "Win32_System_Console",
 ] }
+# Used by the spool writer to compress sealed batches before they sit on
+# disk waiting to be uploaded. Pure Rust API over zstd-sys.
+zstd = "0.13"
