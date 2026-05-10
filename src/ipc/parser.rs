@@ -19,6 +19,54 @@ use crate::ipc::events::{
 };
 use crate::util::time::format_timestamp;
 
+/// Per-event context carried through every printer.
+///
+/// Keeps the printer signatures short and lets us add new fields (an
+/// optional event sequence, hostname, …) without touching every site.
+struct EventCtx<'a> {
+    timestamp: i64,
+    /// Already-formatted "(DROPPED N events …)" suffix, empty when the
+    /// driver reported zero drops since the last delivered event.
+    drop_marker: &'a str,
+    /// Same idea for `trunc_count` — formatted once, appended to each
+    /// printed line, empty when zero.
+    trunc_marker: &'a str,
+}
+
+/// Helper around the "size-check + `read_unaligned`" pattern repeated by
+/// every printer.
+///
+/// Returns the parsed event or an error string mentioning `name`. The
+/// caller has already validated `header.size <= buf.len()`, so this
+/// function only checks against `size_of::<T>()` (i.e. that the driver
+/// actually sent at least one full struct).
+unsafe fn read_packed_event<T: Copy>(buf: &[u8], header_size: u32, name: &str) -> Result<T, String> {
+    if (header_size as usize) < size_of::<T>() {
+        return Err(format!(
+            "{} too small: size={}, expected {}",
+            name,
+            header_size,
+            size_of::<T>()
+        ));
+    }
+    // SAFETY: bounds checked above; layout is `repr(C, packed)`.
+    Ok(unsafe { ptr::read_unaligned(buf.as_ptr() as *const T) })
+}
+
+/// Decode a fixed-size UTF-16 path field embedded in a packed struct.
+///
+/// Returns `<unknown>` for the empty / overlong cases so a missing path
+/// is visible in the log without crashing the printer.
+unsafe fn decode_packed_path<const N: usize>(arr_ptr: *const [u16; N], len: usize) -> String {
+    if len == 0 || len > N {
+        return String::from("<unknown>");
+    }
+    // The array lives inside a packed struct — copy through a raw
+    // pointer to avoid forming a misaligned reference, then decode.
+    let arr: [u16; N] = unsafe { ptr::read_unaligned(arr_ptr) };
+    String::from_utf16_lossy(&arr[..len])
+}
+
 /// Parse one event from `buf` and print it to stdout.
 ///
 /// Returns `Err` on schema mismatch (unknown version, truncated buffer,
@@ -40,6 +88,7 @@ pub fn parse_and_print(buf: &[u8]) -> Result<(), String> {
     let h_timestamp = header.timestamp;
     let h_size = header.size;
     let h_drop = header.drop_count;
+    let h_trunc = header.trunc_count;
 
     if h_version != EVENT_VERSION {
         return Err(format!("unknown event version {}", h_version));
@@ -52,46 +101,45 @@ pub fn parse_and_print(buf: &[u8]) -> Result<(), String> {
         ));
     }
 
-    // If the driver had to drop events between this one and the previous
-    // delivered event, surface that gap inline rather than swallowing it.
+    // Surface gaps + truncations inline rather than swallowing them: a
+    // drop_count > 0 means the kernel ring overflowed, a trunc_count > 0
+    // means a path / value name / data-preview was clipped to fit a
+    // fixed-size buffer.
     let drop_marker = if h_drop > 0 {
         format!(" (DROPPED {} events since last)", h_drop)
     } else {
         String::new()
     };
+    let trunc_marker = if h_trunc > 0 {
+        format!(" (TRUNCATED {} fields since last)", h_trunc)
+    } else {
+        String::new()
+    };
+    let ctx = EventCtx {
+        timestamp: h_timestamp,
+        drop_marker: &drop_marker,
+        trunc_marker: &trunc_marker,
+    };
 
     match h_type {
-        EVENT_TYPE_PROCESS_CREATE => {
-            print_process_create(buf, h_timestamp, h_size, &drop_marker)?;
-        }
-        EVENT_TYPE_PROCESS_EXIT => {
-            print_process_exit(buf, h_timestamp, h_size, &drop_marker)?;
-        }
-        EVENT_TYPE_IMAGE_LOAD => {
-            print_image_load(buf, h_timestamp, h_size, &drop_marker)?;
-        }
-        EVENT_TYPE_REGISTRY_MODIFY => {
-            print_registry_modify(buf, h_timestamp, h_size, &drop_marker)?;
-        }
-        EVENT_TYPE_THREAD_CREATE => {
-            print_thread_create(buf, h_timestamp, h_size, &drop_marker)?;
-        }
-        EVENT_TYPE_THREAD_EXIT => {
-            print_thread_exit(buf, h_timestamp, h_size, &drop_marker)?;
-        }
-        EVENT_TYPE_PROCESS_HANDLE_ACCESS => {
-            print_process_handle_access(buf, h_timestamp, h_size, &drop_marker)?;
-        }
+        EVENT_TYPE_PROCESS_CREATE => print_process_create(buf, h_size, &ctx)?,
+        EVENT_TYPE_PROCESS_EXIT => print_process_exit(buf, h_size, &ctx)?,
+        EVENT_TYPE_IMAGE_LOAD => print_image_load(buf, h_size, &ctx)?,
+        EVENT_TYPE_REGISTRY_MODIFY => print_registry_modify(buf, h_size, &ctx)?,
+        EVENT_TYPE_THREAD_CREATE => print_thread_create(buf, h_size, &ctx)?,
+        EVENT_TYPE_THREAD_EXIT => print_thread_exit(buf, h_size, &ctx)?,
+        EVENT_TYPE_PROCESS_HANDLE_ACCESS => print_process_handle_access(buf, h_size, &ctx)?,
         other => {
             // Unknown event type: header is already validated, so it is
             // safe to print at least the metadata. Future-proofing for
             // when the driver gains new event types.
             println!(
-                "[{}] event type={} size={}{}",
-                format_timestamp(h_timestamp),
+                "[{}] event type={} size={}{}{}",
+                format_timestamp(ctx.timestamp),
                 other,
                 h_size,
-                drop_marker
+                ctx.drop_marker,
+                ctx.trunc_marker
             );
         }
     }
@@ -99,117 +147,67 @@ pub fn parse_and_print(buf: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_process_create(
-    buf: &[u8],
-    timestamp: i64,
-    size: u32,
-    drop_marker: &str,
-) -> Result<(), String> {
-    if (size as usize) < size_of::<ProcessCreateEvent>() {
-        return Err(format!(
-            "ProcessCreate too small: size={}, expected {}",
-            size,
-            size_of::<ProcessCreateEvent>()
-        ));
-    }
-
-    // SAFETY: size validated above; layout is `repr(C, packed)`.
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const ProcessCreateEvent) };
+fn print_process_create(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
+    let evt: ProcessCreateEvent =
+        unsafe { read_packed_event(buf, size, "ProcessCreate")? };
     let pid = evt.process_id;
     let ppid = evt.parent_process_id;
     let cpid = evt.creating_process_id;
     let path_len = evt.image_path_len as usize;
 
-    let image_path = if path_len > 0 && path_len <= IMAGE_PATH_MAX {
-        // `image_path` lives inside a packed struct — go through a raw
-        // pointer to avoid forming a misaligned reference, then decode.
-        let path_arr: [u16; IMAGE_PATH_MAX] =
-            unsafe { ptr::read_unaligned(ptr::addr_of!(evt.image_path)) };
-        String::from_utf16_lossy(&path_arr[..path_len])
-    } else {
-        String::from("<unknown>")
-    };
+    let image_path =
+        unsafe { decode_packed_path::<IMAGE_PATH_MAX>(ptr::addr_of!(evt.image_path), path_len) };
 
     println!(
-        "[{}] ProcessCreate pid={} ppid={} creator={} path=\"{}\"{}",
-        format_timestamp(timestamp),
+        "[{}] ProcessCreate pid={} ppid={} creator={} path=\"{}\"{}{}",
+        format_timestamp(ctx.timestamp),
         pid,
         ppid,
         cpid,
         image_path,
-        drop_marker
+        ctx.drop_marker,
+        ctx.trunc_marker
     );
     Ok(())
 }
 
-fn print_process_exit(
-    buf: &[u8],
-    timestamp: i64,
-    size: u32,
-    drop_marker: &str,
-) -> Result<(), String> {
-    if (size as usize) < size_of::<ProcessExitEvent>() {
-        return Err(format!(
-            "ProcessExit too small: size={}, expected {}",
-            size,
-            size_of::<ProcessExitEvent>()
-        ));
-    }
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const ProcessExitEvent) };
+fn print_process_exit(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
+    let evt: ProcessExitEvent = unsafe { read_packed_event(buf, size, "ProcessExit")? };
     let pid = evt.process_id;
     println!(
-        "[{}] ProcessExit  pid={}{}",
-        format_timestamp(timestamp),
+        "[{}] ProcessExit  pid={}{}{}",
+        format_timestamp(ctx.timestamp),
         pid,
-        drop_marker
+        ctx.drop_marker,
+        ctx.trunc_marker
     );
     Ok(())
 }
 
-fn print_image_load(
-    buf: &[u8],
-    timestamp: i64,
-    size: u32,
-    drop_marker: &str,
-) -> Result<(), String> {
-    if (size as usize) < size_of::<ImageLoadEvent>() {
-        return Err(format!(
-            "ImageLoad too small: size={}, expected {}",
-            size,
-            size_of::<ImageLoadEvent>()
-        ));
-    }
-
-    // SAFETY: size validated above; layout is `repr(C, packed)`.
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const ImageLoadEvent) };
+fn print_image_load(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
+    let evt: ImageLoadEvent = unsafe { read_packed_event(buf, size, "ImageLoad")? };
     let pid = evt.process_id;
     let base = evt.image_base;
     let img_size = evt.image_size;
     let path_len = evt.image_path_len as usize;
 
-    let image_path = if path_len > 0 && path_len <= IMAGE_PATH_MAX {
-        // Same packed-struct gymnastics as print_process_create: copy via
-        // raw pointer to avoid forming a misaligned reference.
-        let path_arr: [u16; IMAGE_PATH_MAX] =
-            unsafe { ptr::read_unaligned(ptr::addr_of!(evt.image_path)) };
-        String::from_utf16_lossy(&path_arr[..path_len])
-    } else {
-        String::from("<unknown>")
-    };
+    let image_path =
+        unsafe { decode_packed_path::<IMAGE_PATH_MAX>(ptr::addr_of!(evt.image_path), path_len) };
 
     // pid==0 marks a kernel-mode image (driver). Highlight it so it
     // stands out from the user-mode DLL noise.
     let scope = if pid == 0 { "kernel" } else { "user" };
 
     println!(
-        "[{}] ImageLoad    pid={} ({}) base=0x{:x} size=0x{:x} path=\"{}\"{}",
-        format_timestamp(timestamp),
+        "[{}] ImageLoad    pid={} ({}) base=0x{:x} size=0x{:x} path=\"{}\"{}{}",
+        format_timestamp(ctx.timestamp),
         pid,
         scope,
         base,
         img_size,
         image_path,
-        drop_marker
+        ctx.drop_marker,
+        ctx.trunc_marker
     );
     Ok(())
 }
@@ -282,7 +280,9 @@ fn render_data_preview(value_type: u32, preview: &[u8]) -> String {
             // the full size is already shown next to it via `data_size`.
             const HEX_LIMIT: usize = 32;
             let take = preview.len().min(HEX_LIMIT);
-            let mut out = String::with_capacity(take * 3);
+            // 3 chars per byte ("xx ") + maybe a trailing " …" — a 4×
+            // capacity avoids any reallocation under the limit.
+            let mut out = String::with_capacity(take * 4);
             for (i, b) in preview[..take].iter().enumerate() {
                 if i > 0 {
                     out.push(' ');
@@ -297,22 +297,8 @@ fn render_data_preview(value_type: u32, preview: &[u8]) -> String {
     }
 }
 
-fn print_registry_modify(
-    buf: &[u8],
-    timestamp: i64,
-    size: u32,
-    drop_marker: &str,
-) -> Result<(), String> {
-    if (size as usize) < size_of::<RegistryEvent>() {
-        return Err(format!(
-            "RegistryModify too small: size={}, expected {}",
-            size,
-            size_of::<RegistryEvent>()
-        ));
-    }
-
-    // SAFETY: size validated above; layout is `repr(C, packed)`.
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const RegistryEvent) };
+fn print_registry_modify(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
+    let evt: RegistryEvent = unsafe { read_packed_event(buf, size, "RegistryModify")? };
     let pid = evt.process_id;
     let op = evt.operation;
     let value_type = evt.value_type;
@@ -321,24 +307,20 @@ fn print_registry_modify(
     let val_len = evt.value_name_len as usize;
     let prev_len = evt.data_preview_len as usize;
 
-    // Decode the key path. As elsewhere, copy the packed array out via a
-    // raw pointer to avoid forming a misaligned reference.
-    let key_path = if key_len > 0 && key_len <= REGISTRY_KEY_PATH_MAX {
-        let arr: [u16; REGISTRY_KEY_PATH_MAX] =
-            unsafe { ptr::read_unaligned(ptr::addr_of!(evt.key_path)) };
-        String::from_utf16_lossy(&arr[..key_len])
-    } else {
-        String::from("<unknown>")
-    };
+    let key_path =
+        unsafe { decode_packed_path::<REGISTRY_KEY_PATH_MAX>(ptr::addr_of!(evt.key_path), key_len) };
 
-    let value_name = if val_len > 0 && val_len <= REGISTRY_VALUE_NAME_MAX {
-        let arr: [u16; REGISTRY_VALUE_NAME_MAX] =
-            unsafe { ptr::read_unaligned(ptr::addr_of!(evt.value_name)) };
-        String::from_utf16_lossy(&arr[..val_len])
-    } else {
-        // Empty / default value name renders as "(default)" — that is the
-        // convention `regedit` uses for the unnamed value of a key.
+    // Empty / default value name renders as "(default)" — that is the
+    // convention `regedit` uses for the unnamed value of a key.
+    let value_name = if val_len == 0 {
         String::from("(default)")
+    } else {
+        unsafe {
+            decode_packed_path::<REGISTRY_VALUE_NAME_MAX>(
+                ptr::addr_of!(evt.value_name),
+                val_len,
+            )
+        }
     };
 
     let label = registry_op_label(op);
@@ -358,8 +340,8 @@ fn print_registry_modify(
             String::new()
         };
         println!(
-            "[{}] Registry {} pid={} key=\"{}\" value=\"{}\" type={} data={}{}{}",
-            format_timestamp(timestamp),
+            "[{}] Registry {} pid={} key=\"{}\" value=\"{}\" type={} data={}{}{}{}",
+            format_timestamp(ctx.timestamp),
             label,
             pid,
             key_path,
@@ -367,47 +349,38 @@ fn print_registry_modify(
             value_type,
             rendered,
             truncated,
-            drop_marker
+            ctx.drop_marker,
+            ctx.trunc_marker
         );
     } else if op == REGISTRY_OP_DELETE_VALUE {
         println!(
-            "[{}] Registry {} pid={} key=\"{}\" value=\"{}\"{}",
-            format_timestamp(timestamp),
+            "[{}] Registry {} pid={} key=\"{}\" value=\"{}\"{}{}",
+            format_timestamp(ctx.timestamp),
             label,
             pid,
             key_path,
             value_name,
-            drop_marker
+            ctx.drop_marker,
+            ctx.trunc_marker
         );
     } else {
         // DeleteKey / RenameKey / CreateKey — value-less.
         println!(
-            "[{}] Registry {} pid={} key=\"{}\"{}",
-            format_timestamp(timestamp),
+            "[{}] Registry {} pid={} key=\"{}\"{}{}",
+            format_timestamp(ctx.timestamp),
             label,
             pid,
             key_path,
-            drop_marker
+            ctx.drop_marker,
+            ctx.trunc_marker
         );
     }
 
     Ok(())
 }
 
-fn print_thread_create(
-    buf: &[u8],
-    timestamp: i64,
-    size: u32,
-    drop_marker: &str,
-) -> Result<(), String> {
-    if (size as usize) < size_of::<ThreadCreateEvent>() {
-        return Err(format!(
-            "ThreadCreate too small: size={}, expected {}",
-            size,
-            size_of::<ThreadCreateEvent>()
-        ));
-    }
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const ThreadCreateEvent) };
+fn print_thread_create(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
+    let evt: ThreadCreateEvent = unsafe { read_packed_event(buf, size, "ThreadCreate")? };
     let pid = evt.process_id;
     let tid = evt.thread_id;
     let creator = evt.creating_process_id;
@@ -422,39 +395,29 @@ fn print_thread_create(
     };
 
     println!(
-        "[{}] ThreadCreate pid={} tid={} creator={}{}{}",
-        format_timestamp(timestamp),
+        "[{}] ThreadCreate pid={} tid={} creator={}{}{}{}",
+        format_timestamp(ctx.timestamp),
         pid,
         tid,
         creator,
         injection_marker,
-        drop_marker
+        ctx.drop_marker,
+        ctx.trunc_marker
     );
     Ok(())
 }
 
-fn print_thread_exit(
-    buf: &[u8],
-    timestamp: i64,
-    size: u32,
-    drop_marker: &str,
-) -> Result<(), String> {
-    if (size as usize) < size_of::<ThreadExitEvent>() {
-        return Err(format!(
-            "ThreadExit too small: size={}, expected {}",
-            size,
-            size_of::<ThreadExitEvent>()
-        ));
-    }
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const ThreadExitEvent) };
+fn print_thread_exit(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
+    let evt: ThreadExitEvent = unsafe { read_packed_event(buf, size, "ThreadExit")? };
     let pid = evt.process_id;
     let tid = evt.thread_id;
     println!(
-        "[{}] ThreadExit   pid={} tid={}{}",
-        format_timestamp(timestamp),
+        "[{}] ThreadExit   pid={} tid={}{}{}",
+        format_timestamp(ctx.timestamp),
         pid,
         tid,
-        drop_marker
+        ctx.drop_marker,
+        ctx.trunc_marker
     );
     Ok(())
 }
@@ -520,18 +483,11 @@ fn decode_process_access(mask: u32) -> String {
 
 fn print_process_handle_access(
     buf: &[u8],
-    timestamp: i64,
     size: u32,
-    drop_marker: &str,
+    ctx: &EventCtx<'_>,
 ) -> Result<(), String> {
-    if (size as usize) < size_of::<ProcessHandleAccessEvent>() {
-        return Err(format!(
-            "ProcessHandleAccess too small: size={}, expected {}",
-            size,
-            size_of::<ProcessHandleAccessEvent>()
-        ));
-    }
-    let evt = unsafe { ptr::read_unaligned(buf.as_ptr() as *const ProcessHandleAccessEvent) };
+    let evt: ProcessHandleAccessEvent =
+        unsafe { read_packed_event(buf, size, "ProcessHandleAccess")? };
     let src = evt.source_process_id;
     let dst = evt.target_process_id;
     let desired = evt.desired_access;
@@ -554,14 +510,15 @@ fn print_process_handle_access(
     };
 
     println!(
-        "[{}] ProcAccess  {} src_pid={} target_pid={} access={}{}{}",
-        format_timestamp(timestamp),
+        "[{}] ProcAccess  {} src_pid={} target_pid={} access={}{}{}{}",
+        format_timestamp(ctx.timestamp),
         label,
         src,
         dst,
         access,
         stripped,
-        drop_marker
+        ctx.drop_marker,
+        ctx.trunc_marker
     );
     Ok(())
 }

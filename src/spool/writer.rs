@@ -29,14 +29,22 @@
 //! never seal a batch — the uploader would have nothing to ship.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::spool::file::ActiveFile;
+
+/// Shortest `recv_timeout` we'll ever wait. Without this, a `max_age`
+/// elapsed-saturating-sub computation can collapse to 0 and the writer
+/// busy-loops at full CPU until the next rotation. 100 ms is small
+/// enough to be invisible to humans and large enough to leave the
+/// scheduler alone.
+const MIN_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Tunables for the spool subsystem.
 #[derive(Clone, Debug)]
@@ -61,20 +69,6 @@ pub struct SpoolConfig {
     pub zstd_level: i32,
 }
 
-impl SpoolConfig {
-    /// Sensible defaults for an endpoint agent.
-    pub fn with_dir(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            max_bytes_per_file: 1 * 1024 * 1024,        // 1 MiB
-            max_age: Duration::from_secs(10),
-            max_total_bytes: 256 * 1024 * 1024,         // 256 MiB
-            channel_capacity: 1024,
-            zstd_level: 3,
-        }
-    }
-}
-
 /// Counters published by the writer thread. The pump increments
 /// `events_dropped` directly when its `try_send` fails; everything else
 /// is the writer's job.
@@ -88,21 +82,27 @@ pub struct SpoolStats {
 
 /// Front-end handle returned by [`spawn_writer`].
 ///
-/// The pump loop only ever uses [`Self::try_submit`]; [`Self::shutdown`]
-/// is called by `main` after the pump exits.
+/// The pump loop only ever uses [`Self::try_submit`] + [`Self::is_alive`];
+/// [`Self::shutdown`] is called by `main` after the pump exits.
 pub struct SpoolHandle {
-    sender: SyncSender<Vec<u8>>,
+    sender: SyncSender<Arc<[u8]>>,
     join: Option<JoinHandle<()>>,
     stats: Arc<SpoolStats>,
+    /// Set to `true` while the writer thread is running. Flips to
+    /// `false` if the thread exits early (failed setup, fatal write
+    /// error). The pump checks it to surface the issue exactly once.
+    alive: Arc<AtomicBool>,
 }
 
 impl SpoolHandle {
     /// Submit one raw event payload to the writer thread.
     ///
-    /// Returns `false` when the channel is full (the writer fell
-    /// behind). The pump should NOT block — losing an event is far
-    /// better than stalling the kernel queue.
-    pub fn try_submit(&self, payload: Vec<u8>) -> bool {
+    /// Takes the payload by `Arc<[u8]>` so the pump can hand off
+    /// ownership without copying the bytes again. Returns `false` when
+    /// the channel is full (the writer fell behind). The pump should
+    /// NOT block — losing an event is far better than stalling the
+    /// kernel queue.
+    pub fn try_submit(&self, payload: Arc<[u8]>) -> bool {
         match self.sender.try_send(payload) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
@@ -117,6 +117,13 @@ impl SpoolHandle {
         &self.stats
     }
 
+    /// `true` while the writer thread is processing events. `false` once
+    /// it has exited (shutdown OR fatal error). The pump uses this to
+    /// log a one-shot warning when the writer dies underneath it.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
     /// Drop the sender (so the writer sees `RecvError` and exits) and
     /// join the thread. Idempotent in the sense that calling it twice
     /// is a logic bug, not a memory bug — `Option::take` makes the
@@ -126,7 +133,7 @@ impl SpoolHandle {
         // so the thread's recv side wakes up. We can't drop `self.sender`
         // by name because it's behind `&mut self` — swap with a fresh
         // closed-channel sender.
-        let (dummy, _) = sync_channel::<Vec<u8>>(1);
+        let (dummy, _) = sync_channel::<Arc<[u8]>>(1);
         let real_sender = std::mem::replace(&mut self.sender, dummy);
         drop(real_sender);
         if let Some(j) = self.join.take() {
@@ -137,29 +144,35 @@ impl SpoolHandle {
 
 /// Spawn the writer thread and return a handle for the pump.
 ///
-/// On any setup failure (couldn't create the spool dir) the function
-/// still returns a handle, but the writer thread exits immediately. The
-/// pump will then drop every event — that's fine; it preserves the
-/// "agent never crashes for a disk-side problem" contract.
-pub fn spawn_writer(config: SpoolConfig) -> SpoolHandle {
+/// Returns `Err` only if the OS refuses to spawn a thread (essentially
+/// "out of memory" — at which point starting an EDR agent is futile
+/// anyway). Setup failures *inside* the thread (cannot create the spool
+/// dir, etc.) are not propagated here: the thread exits, the `alive`
+/// flag flips to `false`, and the pump notices on its next iteration.
+pub fn spawn_writer(config: SpoolConfig) -> io::Result<SpoolHandle> {
     let stats = Arc::new(SpoolStats::default());
-    let (sender, receiver) = sync_channel::<Vec<u8>>(config.channel_capacity);
+    let alive = Arc::new(AtomicBool::new(true));
+    let (sender, receiver) = sync_channel::<Arc<[u8]>>(config.channel_capacity);
 
     let stats_for_thread = Arc::clone(&stats);
+    let alive_for_thread = Arc::clone(&alive);
     let join = thread::Builder::new()
         .name("wedr-spool".into())
-        .spawn(move || writer_main(receiver, config, stats_for_thread))
-        .expect("failed to spawn spool writer thread");
+        .spawn(move || {
+            writer_main(receiver, config, stats_for_thread);
+            alive_for_thread.store(false, Ordering::Release);
+        })?;
 
-    SpoolHandle {
+    Ok(SpoolHandle {
         sender,
         join: Some(join),
         stats,
-    }
+        alive,
+    })
 }
 
 /// Writer thread entry point. Owns the active file and rotates it.
-fn writer_main(rx: Receiver<Vec<u8>>, cfg: SpoolConfig, stats: Arc<SpoolStats>) {
+fn writer_main(rx: Receiver<Arc<[u8]>>, cfg: SpoolConfig, stats: Arc<SpoolStats>) {
     if let Err(e) = fs::create_dir_all(&cfg.dir) {
         eprintln!("[spool] failed to create dir {:?}: {}", cfg.dir, e);
         return;
@@ -182,10 +195,11 @@ fn writer_main(rx: Receiver<Vec<u8>>, cfg: SpoolConfig, stats: Arc<SpoolStats>) 
 
     loop {
         // Wait for the next event OR the time-based rotation deadline,
-        // whichever fires first. The agent is mostly idle, so this
-        // recv_timeout is what shapes the actual rotation cadence.
+        // whichever fires first. Clamp to MIN_RECV_TIMEOUT so a stale
+        // `active_started_at` (or NTP step backwards) cannot collapse
+        // the wait to zero and busy-loop the writer at 100 % CPU.
         let elapsed = active_started_at.elapsed();
-        let timeout = cfg.max_age.saturating_sub(elapsed);
+        let timeout = cfg.max_age.saturating_sub(elapsed).max(MIN_RECV_TIMEOUT);
 
         match rx.recv_timeout(timeout) {
             Ok(payload) => {

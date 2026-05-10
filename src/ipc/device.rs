@@ -2,10 +2,12 @@
 
 use std::io::{self, Write};
 use std::ptr;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_INSUFFICIENT_BUFFER, FALSE, GENERIC_READ, GetLastError, HANDLE,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -29,11 +31,13 @@ const INITIAL_BUF: usize = 4096;
 
 /// Open the driver's control device.
 ///
-/// Returns the raw `HANDLE`. Caller checks against `INVALID_HANDLE_VALUE`
-/// and consults `GetLastError` on failure.
-pub fn open_device() -> HANDLE {
+/// Captures `GetLastError` immediately on failure (so a follow-up Win32
+/// call from the caller can't clobber it) and returns it as an
+/// `io::Error`. The success path returns the raw `HANDLE` for the
+/// caller to use with `DeviceIoControl` etc.
+pub fn open_device() -> io::Result<HANDLE> {
     let path = to_wide_nul(r"\\.\WazabiEDR");
-    unsafe {
+    let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
             GENERIC_READ,
@@ -43,7 +47,15 @@ pub fn open_device() -> HANDLE {
             0,
             ptr::null_mut(),
         )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        // Read GetLastError BEFORE doing anything else — a single
+        // intervening Win32 call (allocation, formatting, …) can
+        // overwrite it.
+        let err = unsafe { GetLastError() };
+        return Err(io::Error::from_raw_os_error(err as i32));
     }
+    Ok(handle)
 }
 
 /// Pump loop: blocking IOCTL → spool + parse → print, until `SHUTDOWN`
@@ -56,6 +68,10 @@ pub fn open_device() -> HANDLE {
 /// the persisted copy of the raw bytes.
 pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>) {
     let mut buf = vec![0u8; INITIAL_BUF];
+    // One-shot guard so we only complain about a dead writer thread the
+    // first time we notice — repeating the warning every iteration would
+    // just spam stderr.
+    let writer_warning_emitted = AtomicBool::new(false);
 
     while !SHUTDOWN.load(Ordering::Acquire) {
         let mut returned: u32 = 0;
@@ -102,8 +118,19 @@ pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>) {
         // (unknown version, etc.) we still want the raw bytes preserved
         // for offline analysis. The submission is non-blocking — full
         // channel = drop, accounted in the spool stats.
+        //
+        // We hand off ownership via `Arc<[u8]>` so the writer thread
+        // doesn't need its own copy of the payload bytes.
         if let Some(spool) = spool {
-            let _ = spool.try_submit(payload.to_vec());
+            if !spool.is_alive() && !writer_warning_emitted.swap(true, Ordering::AcqRel) {
+                eprintln!(
+                    "[agent] spool writer thread is no longer running — \
+                     events will accumulate in the kernel ring and \
+                     eventually be dropped"
+                );
+            }
+            let shared: Arc<[u8]> = Arc::from(payload);
+            let _ = spool.try_submit(shared);
         }
 
         if let Err(e) = parse_and_print(payload) {

@@ -1,0 +1,819 @@
+//! Plugin pipe server: accept connections, run handshakes, ingest events.
+//!
+//! # Concurrency
+//!
+//! - One **acceptor** thread (`wedr-plugin-accept`) creates pipe
+//!   instances and waits for clients with overlapped I/O so it can wake
+//!   up on shutdown. As soon as a client connects, it hands the pipe
+//!   off to a freshly spawned **worker** thread and goes back to
+//!   accepting.
+//! - Each **worker** thread (`wedr-plugin-NNNN`) owns one connected
+//!   pipe end-to-end: identity verification → handshake → event loop.
+//!   Workers use blocking I/O — they do NOT poll [`SHUTDOWN`]; on
+//!   Ctrl+C the agent process exits and the OS reaps them. That's a
+//!   conscious v1 trade-off (graceful shutdown for plugin sessions
+//!   would require overlapped reads / cancellable I/O on every worker,
+//!   which is meaningful complexity for very little value).
+//!
+//! # Limits
+//!
+//! [`MAX_CONCURRENT_SESSIONS`] caps how many plugins can be connected
+//! at once. Hitting the cap returns `too_many_sessions` on the
+//! handshake — a deliberate choice over silently queueing, so a
+//! buggy plugin spawning thousands of processes can't OOM us.
+
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
+use std::ptr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+};
+use windows_sys::Win32::System::IO::{CancelIoEx, OVERLAPPED};
+use windows_sys::Win32::System::Pipes::{
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+};
+use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+use crate::plugin::identity::{
+    ClientIdentity, identify_client, sha256_file_hex, verify_authenticode,
+};
+use crate::plugin::manifest::{
+    ManifestStore, PluginManifest, directory_fingerprint, paths_match,
+};
+use crate::plugin::protocol::{
+    ClientFrame, Event, Hello, HelloAck, MAX_FRAME_BYTES, RejectReason, SCHEMA_VERSION,
+    ServerFrame, read_frame, write_frame, write_reject,
+};
+use crate::shutdown::SHUTDOWN;
+use crate::util::strings::to_wide_nul;
+
+/// The pipe path. Plugins connect to `\\.\pipe\WazabiEDR_plugin`.
+pub const PIPE_NAME: &str = r"\\.\pipe\WazabiEDR_plugin";
+
+/// `HANDLE` is `*mut c_void` and therefore `!Send`. Passing it to a
+/// worker thread requires either a Send wrapper or — what we use here —
+/// a round-trip through `usize`. Kernel handles are address-stable for
+/// their lifetime, so the cast back is safe as long as we recover it on
+/// the receiving thread before using it.
+#[inline]
+fn handle_to_usize(h: HANDLE) -> usize {
+    h as usize
+}
+#[inline]
+fn handle_from_usize(u: usize) -> HANDLE {
+    u as HANDLE
+}
+
+/// Maximum number of plugin sessions running concurrently. New
+/// connections beyond this are rejected with `too_many_sessions`.
+pub const MAX_CONCURRENT_SESSIONS: usize = 64;
+
+/// Per-instance buffers for the named pipe. 64 KiB is large enough for
+/// any single frame we accept (capped at 1 MiB by the protocol layer,
+/// but the kernel pipe buffer doesn't need to size to the worst case).
+const PIPE_BUF_SIZE: u32 = 64 * 1024;
+
+/// Suggested heartbeat interval advertised in the HelloAck. Plugins
+/// don't have to honour it — but if they don't and the worker reads
+/// nothing for ~3× this, we'd ideally drop them. Read timeout is a
+/// future improvement (see module-level note about overlapped reads).
+const HEARTBEAT_SEC: u32 = 30;
+
+/// How often the reload thread re-checks the manifest directory.
+/// 5 s is fast enough that an admin running `wedr-plugin enroll` sees
+/// their plugin pick up "almost immediately" without polling so often
+/// that it hits the disk for nothing on a quiet endpoint.
+const MANIFEST_RELOAD_INTERVAL_SEC: u64 = 5;
+
+/// How often the stats thread logs a one-line summary. Quiet enough to
+/// not pollute the agent's stdout, frequent enough to spot a stuck
+/// plugin or a runaway counter within a few minutes.
+const STATS_LOG_INTERVAL_SEC: u64 = 30;
+
+/// Counters published by the plugin server. Lightweight: bumped from
+/// hot paths but never read in the hot path.
+#[derive(Default)]
+pub struct PluginStats {
+    pub sessions_accepted: AtomicU64,
+    pub sessions_rejected: AtomicU64,
+    pub events_received: AtomicU64,
+    pub events_invalid: AtomicU64,
+    /// Number of times the manifest store was reloaded from disk
+    /// (excluding the initial load at startup).
+    pub manifest_reloads: AtomicU64,
+    /// Plugins currently enrolled (size of the live manifest store).
+    /// Updated on every reload so a `stats` snapshot reflects the
+    /// current state, not the startup state.
+    pub enrolled_plugins: AtomicUsize,
+}
+
+/// Front-end handle for the running plugin server.
+pub struct PluginServerHandle {
+    join: Option<JoinHandle<()>>,
+    /// `None` means we couldn't spawn the reload thread (rare; OOM).
+    /// The agent stays usable, manifests just aren't hot-reloaded.
+    reload_join: Option<JoinHandle<()>>,
+    /// `None` means we couldn't spawn the stats thread. Logging is
+    /// best-effort, the server keeps running.
+    stats_join: Option<JoinHandle<()>>,
+    stats: Arc<PluginStats>,
+    /// Active session counter shared with the acceptor; exposed via
+    /// `active_sessions()` so the operator-facing stats summary at
+    /// shutdown can include "still N sessions live."
+    active_sessions: Arc<AtomicUsize>,
+}
+
+impl PluginServerHandle {
+    pub fn stats(&self) -> &PluginStats {
+        &self.stats
+    }
+
+    /// Number of plugin sessions currently being handled.
+    pub fn active_sessions(&self) -> usize {
+        self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Wait for the background threads to exit. Workers may outlive
+    /// this (until they finish their session or the process exits).
+    pub fn shutdown(mut self) {
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+        if let Some(j) = self.reload_join.take() {
+            let _ = j.join();
+        }
+        if let Some(j) = self.stats_join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+/// Spawn the accept loop and the manifest-reload thread. Returns
+/// immediately. `manifest_dir` is where the agent looks for plugin
+/// manifests on disk.
+///
+/// Two background threads result:
+/// - `wedr-plugin-accept` — pipe accept loop + per-session worker spawn
+/// - `wedr-plugin-reload` — periodic re-scan of `manifest_dir`, swaps
+///   the live store atomically when it detects a change.
+pub fn spawn_server(manifest_dir: PathBuf) -> io::Result<PluginServerHandle> {
+    let stats = Arc::new(PluginStats::default());
+
+    // Initial manifest load — failures are tolerated (empty store).
+    let initial = match ManifestStore::load_dir(&manifest_dir) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!(
+                "[plugin] failed to load manifests from {:?}: {} — \
+                 starting with an empty store",
+                manifest_dir, e
+            );
+            Arc::new(ManifestStore::empty())
+        }
+    };
+    stats
+        .enrolled_plugins
+        .store(initial.len(), Ordering::Relaxed);
+    eprintln!(
+        "[plugin] {} plugin(s) enrolled at startup ({})",
+        initial.len(),
+        manifest_dir.display()
+    );
+
+    let store: Arc<RwLock<Arc<ManifestStore>>> = Arc::new(RwLock::new(initial));
+    let active_sessions = Arc::new(AtomicUsize::new(0));
+
+    // Accept thread.
+    let accept_store = Arc::clone(&store);
+    let accept_stats = Arc::clone(&stats);
+    let accept_active = Arc::clone(&active_sessions);
+    let accept_join = thread::Builder::new()
+        .name("wedr-plugin-accept".into())
+        .spawn(move || accept_loop(accept_store, accept_stats, accept_active))?;
+
+    // Reload thread. Spawn fallibly but DON'T fail spawn_server on its
+    // failure: the accept loop is the load-bearing path, hot reload is
+    // a quality-of-life feature.
+    let reload_store = Arc::clone(&store);
+    let reload_stats = Arc::clone(&stats);
+    let reload_dir = manifest_dir.clone();
+    let reload_join = thread::Builder::new()
+        .name("wedr-plugin-reload".into())
+        .spawn(move || reload_loop(reload_dir, reload_store, reload_stats))
+        .ok();
+    if reload_join.is_none() {
+        eprintln!(
+            "[plugin] could not spawn reload thread — manifest changes will \
+             only be picked up on agent restart"
+        );
+    }
+
+    // Stats thread. Same best-effort posture.
+    let stats_for_logger = Arc::clone(&stats);
+    let active_for_logger = Arc::clone(&active_sessions);
+    let stats_join = thread::Builder::new()
+        .name("wedr-plugin-stats".into())
+        .spawn(move || stats_loop(stats_for_logger, active_for_logger))
+        .ok();
+
+    Ok(PluginServerHandle {
+        join: Some(accept_join),
+        reload_join,
+        stats_join,
+        stats,
+        active_sessions,
+    })
+}
+
+// =====================================================================
+// Acceptor
+// =====================================================================
+
+fn accept_loop(
+    store: Arc<RwLock<Arc<ManifestStore>>>,
+    stats: Arc<PluginStats>,
+    active_sessions: Arc<AtomicUsize>,
+) {
+    eprintln!("[plugin] server listening on {}", PIPE_NAME);
+
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        let pipe = match create_pipe_instance() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[plugin] CreateNamedPipeW failed: {} — retrying", e);
+                // Brief sleep so we don't busy-loop if the system is
+                // out of pipe instances or similar transient failure.
+                thread::sleep(std::time::Duration::from_millis(500));
+                continue;
+            }
+        };
+
+        match wait_for_client(pipe) {
+            Ok(true) => {
+                stats.sessions_accepted.fetch_add(1, Ordering::Relaxed);
+
+                // Cap concurrent sessions: bump the counter, refuse if
+                // we'd exceed. Decrement is the worker's responsibility.
+                let count = active_sessions.fetch_add(1, Ordering::AcqRel);
+                if count >= MAX_CONCURRENT_SESSIONS {
+                    active_sessions.fetch_sub(1, Ordering::AcqRel);
+                    stats.sessions_rejected.fetch_add(1, Ordering::Relaxed);
+                    let mut stream = PipeStream::new(pipe);
+                    let _ = write_reject(&mut stream, RejectReason::TooManySessions);
+                    unsafe {
+                        DisconnectNamedPipe(pipe);
+                        CloseHandle(pipe);
+                    }
+                    continue;
+                }
+
+                // Snapshot the current manifest store under a brief
+                // read lock. After this, the worker is lock-free for
+                // the entire session — a concurrent reload will swap
+                // the lock's content but not affect this Arc.
+                let session_store = match store.read() {
+                    Ok(g) => Arc::clone(&*g),
+                    Err(p) => {
+                        // Poisoned RwLock: another thread panicked
+                        // while holding the write lock. Recover by
+                        // grabbing the inner Arc anyway — the data is
+                        // still valid (we never expose mutating refs).
+                        Arc::clone(&*p.into_inner())
+                    }
+                };
+
+                let stats_thread = Arc::clone(&stats);
+                let counter = Arc::clone(&active_sessions);
+                let pid_label = stats.sessions_accepted.load(Ordering::Relaxed);
+                let name = format!("wedr-plugin-{:04}", pid_label);
+                let pipe_addr = handle_to_usize(pipe);
+                let spawn_result = thread::Builder::new().name(name).spawn(move || {
+                    let pipe = handle_from_usize(pipe_addr);
+                    let _ = handle_session(pipe, &session_store, &stats_thread);
+                    unsafe {
+                        DisconnectNamedPipe(pipe);
+                        CloseHandle(pipe);
+                    }
+                    counter.fetch_sub(1, Ordering::AcqRel);
+                });
+
+                if let Err(e) = spawn_result {
+                    eprintln!("[plugin] could not spawn worker: {} — closing pipe", e);
+                    active_sessions.fetch_sub(1, Ordering::AcqRel);
+                    unsafe {
+                        DisconnectNamedPipe(pipe);
+                        CloseHandle(pipe);
+                    }
+                }
+            }
+            Ok(false) => {
+                // Shutdown was requested while we were waiting — close
+                // the unused pipe and exit the loop on the next check.
+                unsafe { CloseHandle(pipe) };
+            }
+            Err(e) => {
+                eprintln!("[plugin] ConnectNamedPipe failed: {}", e);
+                unsafe { CloseHandle(pipe) };
+            }
+        }
+    }
+
+    eprintln!("[plugin] accept loop exited");
+}
+
+/// Periodic stats logger. One short line every
+/// [`STATS_LOG_INTERVAL_SEC`] seconds, suppressed when nothing has
+/// happened since the last tick (keeps the log clean on quiet hosts).
+fn stats_loop(stats: Arc<PluginStats>, active: Arc<AtomicUsize>) {
+    let mut prev_accepted: u64 = 0;
+    let mut prev_received: u64 = 0;
+
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        // 250 ms slices for shutdown responsiveness.
+        for _ in 0..(STATS_LOG_INTERVAL_SEC * 4) {
+            if SHUTDOWN.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+
+        let accepted = stats.sessions_accepted.load(Ordering::Relaxed);
+        let received = stats.events_received.load(Ordering::Relaxed);
+        let active_now = active.load(Ordering::Relaxed);
+        let enrolled = stats.enrolled_plugins.load(Ordering::Relaxed);
+        let reloads = stats.manifest_reloads.load(Ordering::Relaxed);
+
+        // If the counters didn't move at all, skip the line so an idle
+        // host doesn't paint stderr with "0 events" forever.
+        let accepted_delta = accepted.saturating_sub(prev_accepted);
+        let received_delta = received.saturating_sub(prev_received);
+        if accepted_delta == 0 && received_delta == 0 && active_now == 0 {
+            continue;
+        }
+
+        eprintln!(
+            "[plugin] stats — active: {}, sessions Δ: {}, events Δ: {}, \
+             enrolled: {}, reloads: {}",
+            active_now, accepted_delta, received_delta, enrolled, reloads
+        );
+
+        prev_accepted = accepted;
+        prev_received = received;
+    }
+}
+
+/// Manifest reload loop. Polls `dir` every
+/// [`MANIFEST_RELOAD_INTERVAL_SEC`]; on a fingerprint change, builds a
+/// fresh `ManifestStore` and atomically swaps the live one.
+///
+/// In-flight sessions are unaffected (they hold their own `Arc` to the
+/// previous store). New sessions accepted after the swap see the new
+/// manifests.
+fn reload_loop(
+    dir: PathBuf,
+    store: Arc<RwLock<Arc<ManifestStore>>>,
+    stats: Arc<PluginStats>,
+) {
+    // Sleep first so we don't immediately rescan the directory we just
+    // loaded at startup.
+    let mut last_fp = match store.read() {
+        Ok(g) => g.fingerprint(),
+        Err(p) => p.into_inner().fingerprint(),
+    };
+
+    while !SHUTDOWN.load(Ordering::Acquire) {
+        // Poll in 250 ms slices so shutdown is responsive.
+        for _ in 0..(MANIFEST_RELOAD_INTERVAL_SEC * 4) {
+            if SHUTDOWN.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+
+        let fp = directory_fingerprint(&dir);
+        if fp == last_fp {
+            continue;
+        }
+
+        // Something changed. Re-load and swap. Keep the previous store
+        // around if reload fails — better stale than empty.
+        match ManifestStore::load_dir(&dir) {
+            Ok(new_store) => {
+                let new_len = new_store.len();
+                let new_arc = Arc::new(new_store);
+                match store.write() {
+                    Ok(mut g) => *g = new_arc,
+                    Err(p) => *p.into_inner() = new_arc,
+                };
+                stats.enrolled_plugins.store(new_len, Ordering::Relaxed);
+                stats.manifest_reloads.fetch_add(1, Ordering::Relaxed);
+                last_fp = fp;
+                eprintln!(
+                    "[plugin] manifest store reloaded — {} plugin(s) enrolled",
+                    new_len
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[plugin] manifest reload failed ({}); keeping previous store",
+                    e
+                );
+                // Don't update `last_fp` — we want to retry on the next
+                // tick if the operator is mid-edit and the dir was
+                // momentarily inconsistent.
+            }
+        }
+    }
+}
+
+/// Create one named-pipe instance configured the way we need.
+///
+/// `PIPE_REJECT_REMOTE_CLIENTS` is critical: without it, a plugin pipe
+/// is reachable over SMB from any host on the network (with the right
+/// creds). For an EDR endpoint pipe that's a non-starter — we want
+/// local-only connections.
+fn create_pipe_instance() -> io::Result<HANDLE> {
+    let wide = to_wide_nul(PIPE_NAME);
+    // SECURITY NOTE: passing a NULL SECURITY_ATTRIBUTES gives the pipe
+    // the default DACL — owner + LocalSystem + Administrators have
+    // full access, Authenticated Users get GENERIC_READ | FILE_WRITE_*
+    // on the *first* instance for the same session. That is permissive
+    // enough that a same-user plugin can connect, restrictive enough
+    // that another user on the same box cannot trivially reach us.
+    // Tightening this further (custom DACL granting only enrolled
+    // plugins) is a future hardening once we ship hot-reload.
+    let h = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            PIPE_UNLIMITED_INSTANCES,
+            PIPE_BUF_SIZE,
+            PIPE_BUF_SIZE,
+            0, // default timeout (50 ms) for legacy WaitNamedPipe — we don't use it
+            ptr::null(),
+        )
+    };
+    if h.is_null() || h == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        let err = unsafe { GetLastError() };
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+    Ok(h)
+}
+
+/// Wait for a client to connect, with periodic shutdown polling.
+///
+/// Returns `Ok(true)` when a client has connected, `Ok(false)` when we
+/// got woken up by shutdown before any client showed up, and `Err` for
+/// genuine OS failures.
+fn wait_for_client(pipe: HANDLE) -> io::Result<bool> {
+    let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+    if event.is_null() {
+        let err = unsafe { GetLastError() };
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event;
+
+    let ok = unsafe { ConnectNamedPipe(pipe, &mut overlapped) };
+    if ok == 0 {
+        let err = unsafe { GetLastError() };
+        match err {
+            // Most common path: pipe is now waiting, the OVERLAPPED
+            // event will be signalled when a client connects.
+            e if e == ERROR_IO_PENDING => {}
+            // Race: a client connected between CreateNamedPipe and
+            // ConnectNamedPipe. Treat as success.
+            e if e == ERROR_PIPE_CONNECTED => {
+                unsafe { CloseHandle(event) };
+                return Ok(true);
+            }
+            other => {
+                unsafe { CloseHandle(event) };
+                return Err(io::Error::from_raw_os_error(other as i32));
+            }
+        }
+    }
+
+    // Poll the event with a 250 ms granularity so SHUTDOWN gets noticed
+    // promptly without burning CPU in a tight loop.
+    loop {
+        let wait = unsafe { WaitForSingleObject(event, 250) };
+        if wait == WAIT_OBJECT_0 {
+            unsafe { CloseHandle(event) };
+            return Ok(true);
+        }
+        if wait == WAIT_TIMEOUT {
+            if SHUTDOWN.load(Ordering::Acquire) {
+                // Cancel the pending connect so the kernel releases the
+                // queued I/O before we close the handles.
+                unsafe { CancelIoEx(pipe, &overlapped) };
+                unsafe { CloseHandle(event) };
+                return Ok(false);
+            }
+            continue;
+        }
+        // WAIT_FAILED or anything else: surface as an error so the
+        // accept loop can log and try a fresh pipe instance.
+        let err = unsafe { GetLastError() };
+        unsafe { CloseHandle(event) };
+        return Err(io::Error::from_raw_os_error(err as i32));
+    }
+}
+
+// =====================================================================
+// Worker / per-session
+// =====================================================================
+
+/// Whole lifecycle of one connected plugin: identity → handshake → events.
+fn handle_session(
+    pipe: HANDLE,
+    store: &ManifestStore,
+    stats: &PluginStats,
+) -> Result<(), String> {
+    let identity = identify_client(pipe).map_err(|e| format!("identity: {}", e))?;
+    let mut stream = PipeStream::new(pipe);
+
+    // Read HELLO. Anything other than a Hello on the first frame is a
+    // protocol violation — we politely send a Reject and disconnect.
+    let hello = match read_frame(&mut stream) {
+        Ok(Some(ClientFrame::Hello(h))) => h,
+        Ok(Some(_)) | Ok(None) | Err(_) => {
+            stats.sessions_rejected.fetch_add(1, Ordering::Relaxed);
+            let _ = write_reject(&mut stream, RejectReason::BadHandshake);
+            return Err("bad first frame".into());
+        }
+    };
+
+    // Validate against manifest store + OS identity.
+    let manifest = match validate_handshake(&hello, &identity, store) {
+        Ok(m) => m,
+        Err(reason) => {
+            stats.sessions_rejected.fetch_add(1, Ordering::Relaxed);
+            let _ = write_reject(&mut stream, reason);
+            eprintln!(
+                "[plugin] rejected pid={} path={:?} plugin_id={:?} reason={}",
+                identity.pid,
+                identity.image_path,
+                hello.plugin_id,
+                reason.as_str()
+            );
+            return Err(format!("rejected: {}", reason.as_str()));
+        }
+    };
+
+    // Mint a fresh session_id without pulling a UUID crate: 16 random
+    // bytes from the system entropy via BCryptGenRandom would be the
+    // "right" choice; for v1 we use a 128-bit value derived from the
+    // PID + a process-monotonic counter + timestamp. It only has to be
+    // unique among live sessions for attribution to work — it's not a
+    // secret. See gen_session_id.
+    let session_id = gen_session_id(identity.pid);
+
+    let ack = HelloAck {
+        session_id: session_id.clone(),
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        max_payload_bytes: MAX_FRAME_BYTES,
+        heartbeat_sec: HEARTBEAT_SEC,
+    };
+    if let Err(e) = write_frame(&mut stream, &ServerFrame::HelloAck(ack)) {
+        return Err(format!("write HelloAck: {}", e));
+    }
+
+    eprintln!(
+        "[plugin] session opened plugin_id={} name={:?} pid={} path={:?} session_id={}",
+        manifest.plugin_id, manifest.name, identity.pid, identity.image_path, session_id
+    );
+
+    // Steady state: read frames, dispatch, repeat. Any error or clean
+    // EOF tears down the session.
+    loop {
+        match read_frame(&mut stream) {
+            Ok(Some(ClientFrame::Event(ev))) => {
+                stats.events_received.fetch_add(1, Ordering::Relaxed);
+                emit_event(&manifest, &identity, &session_id, &ev);
+            }
+            Ok(Some(ClientFrame::Heartbeat(_))) => {
+                // No state to update yet — heartbeat exists so a future
+                // server-side timeout can know the plugin is alive.
+                continue;
+            }
+            Ok(Some(ClientFrame::Hello(_))) => {
+                // Hello after handshake: protocol error.
+                stats.events_invalid.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[plugin] session_id={} sent Hello mid-session — disconnecting",
+                    session_id
+                );
+                break;
+            }
+            Ok(Some(ClientFrame::Goodbye {})) => {
+                eprintln!(
+                    "[plugin] session_id={} closed cleanly (goodbye)",
+                    session_id
+                );
+                break;
+            }
+            Ok(None) => {
+                // Clean EOF.
+                eprintln!("[plugin] session_id={} disconnected", session_id);
+                break;
+            }
+            Err(e) => {
+                stats.events_invalid.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[plugin] session_id={} frame error: {}", session_id, e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Apply all enabled identity + integrity checks. Returns the manifest
+/// the plugin is bound to on success, or a [`RejectReason`] otherwise.
+fn validate_handshake<'a>(
+    hello: &Hello,
+    identity: &ClientIdentity,
+    store: &'a ManifestStore,
+) -> Result<&'a PluginManifest, RejectReason> {
+    if hello.schema_version != SCHEMA_VERSION {
+        return Err(RejectReason::SchemaMismatch);
+    }
+
+    let manifest = store
+        .get(&hello.plugin_id)
+        .ok_or(RejectReason::UnknownPluginId)?;
+
+    if manifest.revoked {
+        return Err(RejectReason::Revoked);
+    }
+
+    if !paths_match(&identity.image_path, &manifest.expected_path) {
+        return Err(RejectReason::PathMismatch);
+    }
+
+    if let Some(expected) = manifest.expected_sha256.as_deref() {
+        match sha256_file_hex(&identity.image_path) {
+            Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
+            Ok(_) => return Err(RejectReason::HashMismatch),
+            Err(_) => return Err(RejectReason::HashMismatch),
+        }
+    }
+
+    if manifest.expected_signer.is_some() {
+        if verify_authenticode(&identity.image_path).is_err() {
+            return Err(RejectReason::SignatureInvalid);
+        }
+        // Subject-DN match is a TODO — see verify_authenticode.
+    }
+
+    Ok(manifest)
+}
+
+/// Stamp an event with session attribution and emit it to stdout.
+///
+/// In v1 we only print to stdout for human consumption. Persisting
+/// plugin events to the spool will reuse the existing length-prefixed
+/// framing in a `<spool>/plugins/` subdirectory; that wiring is left
+/// for the next milestone (the spool's framing currently assumes raw
+/// kernel-event bytes, which would conflate kinds in one stream).
+fn emit_event(
+    manifest: &PluginManifest,
+    identity: &ClientIdentity,
+    session_id: &str,
+    ev: &Event,
+) {
+    // We rebuild a JSON line ourselves rather than re-serialising via
+    // serde so the attribution fields are guaranteed to come from the
+    // session and not from anything the plugin could have stuffed into
+    // its event payload.
+    //
+    // serde_json::to_string is fine for the user payload; we only have
+    // to be careful that we don't trust event.kind for routing without
+    // sanitising — for now it's logged verbatim with proper escaping.
+    let payload_json = serde_json::to_string(&ev.payload).unwrap_or_else(|_| "null".into());
+    let kind_escaped = serde_json::to_string(&ev.kind).unwrap_or_else(|_| "\"\"".into());
+
+    println!(
+        "{{\"plugin_id\":{:?},\"plugin_name\":{:?},\"plugin_pid\":{},\
+         \"session_id\":{:?},\"seq\":{},\"ts_unix_ns\":{},\
+         \"kind\":{},\"payload\":{}}}",
+        manifest.plugin_id,
+        manifest.name,
+        identity.pid,
+        session_id,
+        ev.seq,
+        ev.ts_unix_ns,
+        kind_escaped,
+        payload_json
+    );
+}
+
+/// Generate an opaque, per-session identifier.
+///
+/// 128 bits of "good enough" uniqueness: a process-monotonic counter, a
+/// nanosecond timestamp, the PID of the connecting plugin, and a few
+/// bits from the system clock. NOT a secret, NOT cryptographically
+/// random — only a routing key. Crash-restart of the agent gives a
+/// fresh counter; collisions across two live sessions are practically
+/// impossible without contrived clock manipulation.
+fn gen_session_id(pid: u32) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    // 8-4-4-4-12 hex layout is just for visual convention; this is not
+    // an RFC-compliant UUID, hence the leading "s-" so nobody parses it
+    // as one downstream.
+    format!(
+        "s-{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+        pid,
+        (ns >> 48) as u16,
+        (ns >> 32) as u16 & 0xffff,
+        (n >> 48) as u16,
+        n & 0x0000_ffff_ffff_ffff
+    )
+}
+
+// =====================================================================
+// PipeStream: Read+Write adapter over a HANDLE
+// =====================================================================
+
+/// Thin Read/Write wrapper around a connected pipe HANDLE so the
+/// protocol layer's `read_frame` / `write_frame` can use any standard
+/// `io::Read` / `io::Write` trait bounds.
+///
+/// Does NOT close the handle on drop — the worker that owns the
+/// handle is responsible for `DisconnectNamedPipe` + `CloseHandle`.
+pub struct PipeStream {
+    handle: HANDLE,
+}
+
+impl PipeStream {
+    pub fn new(handle: HANDLE) -> Self {
+        Self { handle }
+    }
+}
+
+impl Read for PipeStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut n: u32 = 0;
+        let ok = unsafe {
+            ReadFile(
+                self.handle,
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                &mut n,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            // ERROR_BROKEN_PIPE (109): client closed; report 0 to
+            // signal clean EOF, matching std::net::TcpStream behaviour.
+            if err == 109 {
+                return Ok(0);
+            }
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        Ok(n as usize)
+    }
+}
+
+impl Write for PipeStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut n: u32 = 0;
+        let ok = unsafe {
+            WriteFile(
+                self.handle,
+                buf.as_ptr(),
+                buf.len() as u32,
+                &mut n,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { GetLastError() };
+            return Err(io::Error::from_raw_os_error(err as i32));
+        }
+        Ok(n as usize)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}

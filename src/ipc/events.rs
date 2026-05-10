@@ -6,7 +6,10 @@
 
 /// Schema version we expect from the driver. Mismatched versions produce a
 /// parse error rather than a misinterpreted event.
-pub const EVENT_VERSION: u16 = 3;
+///
+/// Bumped to 4 when `EventHeader::trunc_count` was added on the driver
+/// side (counter of fields truncated to fit fixed-size buffers).
+pub const EVENT_VERSION: u16 = 4;
 
 pub const EVENT_TYPE_PROCESS_CREATE: u16 = 1;
 pub const EVENT_TYPE_PROCESS_EXIT: u16 = 2;
@@ -50,6 +53,10 @@ pub struct EventHeader {
     /// Number of events the driver dropped between the previous delivered
     /// event and this one.
     pub drop_count: u32,
+    /// Number of path / value-name / data-preview fields the driver had
+    /// to truncate (because they exceeded the per-event fixed-size
+    /// buffers) since the previous delivered event.
+    pub trunc_count: u32,
 }
 
 #[repr(C, packed)]

@@ -7,11 +7,38 @@ edition = "2024"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
     "Win32_System_Time",
     "Win32_System_Console",
 ] }
 # Used by the spool writer to compress sealed batches before they sit on
 # disk waiting to be uploaded. Pure Rust API over zstd-sys.
 zstd = "0.13"
+
+# Plugin telemetry uses JSON on the wire because (a) plugin payloads are
+# arbitrary author-defined documents — hand-rolling a parser for arbitrary
+# nested input is not viable, and (b) every language has a JSON client, so
+# any third-party plugin can talk to us without a custom SDK.
+#
+# The hot kernel-event path (driver → agent → spool) stays dependency-free
+# binary; serde only touches the plugin sub-system.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Smaller, faster, no-debug-info release builds. `panic = "abort"` keeps
+# us in line with the driver's panic policy and removes the unwinding
+# tables; `lto = "thin"` and `codegen-units = 1` give the linker the
+# whole-program view it needs for cross-crate inlining; `strip = true`
+# trims symbols out of the final EXE.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
