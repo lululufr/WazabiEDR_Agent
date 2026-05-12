@@ -14,6 +14,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
+use crate::ipc::json::encode_kernel_event;
 use crate::ipc::parser::parse_and_print;
 use crate::shutdown::SHUTDOWN;
 use crate::spool::SpoolHandle;
@@ -61,12 +62,16 @@ pub fn open_device() -> io::Result<HANDLE> {
 /// Pump loop: blocking IOCTL → spool + parse → print, until `SHUTDOWN`
 /// is set or a fatal error is returned by the driver.
 ///
-/// `spool` is optional so the agent still works (printing only) if the
+/// `spool` is optional so the agent still works (stdout only) if the
 /// spool subsystem failed to initialise. When provided, every received
 /// event is forwarded to the writer thread *before* parsing — that way
 /// a parse error (unknown event type, schema mismatch) doesn't cost us
 /// the persisted copy of the raw bytes.
-pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>) {
+///
+/// `console_output` controls whether the human-readable line goes to
+/// stdout. Diagnostic stderr messages and the spool path are not
+/// affected — turning console off is purely a stdout suppressor.
+pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>, console_output: bool) {
     let mut buf = vec![0u8; INITIAL_BUF];
     // One-shot guard so we only complain about a dead writer thread the
     // first time we notice — repeating the warning every iteration would
@@ -114,13 +119,13 @@ pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>) {
 
         let payload = &buf[..returned as usize];
 
-        // Persist BEFORE parsing: if `parse_and_print` rejects the event
-        // (unknown version, etc.) we still want the raw bytes preserved
-        // for offline analysis. The submission is non-blocking — full
-        // channel = drop, accounted in the spool stats.
-        //
-        // We hand off ownership via `Arc<[u8]>` so the writer thread
-        // doesn't need its own copy of the payload bytes.
+        // Serialise to NDJSON for the spool. Doing it here (on the pump
+        // thread) trades a small CPU cost for a simpler writer: the
+        // spool stays format-agnostic, the plugin server can reuse the
+        // same submit path with its own already-JSON payload. If
+        // encoding fails (unknown event version, truncated buffer), we
+        // log and drop — the raw bytes wouldn't be re-parseable by any
+        // downstream consumer anyway.
         if let Some(spool) = spool {
             if !spool.is_alive() && !writer_warning_emitted.swap(true, Ordering::AcqRel) {
                 eprintln!(
@@ -129,14 +134,21 @@ pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>) {
                      eventually be dropped"
                 );
             }
-            let shared: Arc<[u8]> = Arc::from(payload);
-            let _ = spool.try_submit(shared);
+            match encode_kernel_event(payload) {
+                Ok(line) => {
+                    let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
+                    let _ = spool.try_submit(shared);
+                }
+                Err(e) => eprintln!("[agent] spool encode error: {}", e),
+            }
         }
 
-        if let Err(e) = parse_and_print(payload) {
-            eprintln!("[agent] parse error: {}", e);
+        if console_output {
+            if let Err(e) = parse_and_print(payload) {
+                eprintln!("[agent] parse error: {}", e);
+            }
+            io::stdout().flush().ok();
         }
-        io::stdout().flush().ok();
     }
 }
 

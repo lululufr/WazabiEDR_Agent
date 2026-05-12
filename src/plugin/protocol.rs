@@ -266,8 +266,7 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<ClientFrame>, FrameError>
 /// Encode + write one outbound frame.
 pub fn write_frame<W: Write>(w: &mut W, frame: &ServerFrame) -> Result<(), FrameError> {
     let body = serde_json::to_vec(frame).map_err(FrameError::Json)?;
-    let len = u32::try_from(body.len())
-        .map_err(|_| FrameError::TooLarge(u32::MAX))?;
+    let len = u32::try_from(body.len()).map_err(|_| FrameError::TooLarge(u32::MAX))?;
     if len > MAX_FRAME_BYTES {
         return Err(FrameError::TooLarge(len));
     }

@@ -12,10 +12,10 @@ use crate::ipc::events::{
     EVENT_TYPE_PROCESS_HANDLE_ACCESS, EVENT_TYPE_REGISTRY_MODIFY, EVENT_TYPE_THREAD_CREATE,
     EVENT_TYPE_THREAD_EXIT, EVENT_VERSION, EventHeader, HANDLE_ACCESS_OP_CREATE,
     HANDLE_ACCESS_OP_DUPLICATE, IMAGE_PATH_MAX, ImageLoadEvent, ProcessCreateEvent,
-    ProcessExitEvent, ProcessHandleAccessEvent, REGISTRY_DATA_PREVIEW_MAX,
-    REGISTRY_KEY_PATH_MAX, REGISTRY_OP_CREATE_KEY, REGISTRY_OP_DELETE_KEY,
-    REGISTRY_OP_DELETE_VALUE, REGISTRY_OP_RENAME_KEY, REGISTRY_OP_SET_VALUE,
-    REGISTRY_VALUE_NAME_MAX, RegistryEvent, ThreadCreateEvent, ThreadExitEvent,
+    ProcessExitEvent, ProcessHandleAccessEvent, REGISTRY_DATA_PREVIEW_MAX, REGISTRY_KEY_PATH_MAX,
+    REGISTRY_OP_CREATE_KEY, REGISTRY_OP_DELETE_KEY, REGISTRY_OP_DELETE_VALUE,
+    REGISTRY_OP_RENAME_KEY, REGISTRY_OP_SET_VALUE, REGISTRY_VALUE_NAME_MAX, RegistryEvent,
+    ThreadCreateEvent, ThreadExitEvent,
 };
 use crate::util::time::format_timestamp;
 
@@ -40,7 +40,11 @@ struct EventCtx<'a> {
 /// caller has already validated `header.size <= buf.len()`, so this
 /// function only checks against `size_of::<T>()` (i.e. that the driver
 /// actually sent at least one full struct).
-unsafe fn read_packed_event<T: Copy>(buf: &[u8], header_size: u32, name: &str) -> Result<T, String> {
+unsafe fn read_packed_event<T: Copy>(
+    buf: &[u8],
+    header_size: u32,
+    name: &str,
+) -> Result<T, String> {
     if (header_size as usize) < size_of::<T>() {
         return Err(format!(
             "{} too small: size={}, expected {}",
@@ -148,8 +152,7 @@ pub fn parse_and_print(buf: &[u8]) -> Result<(), String> {
 }
 
 fn print_process_create(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
-    let evt: ProcessCreateEvent =
-        unsafe { read_packed_event(buf, size, "ProcessCreate")? };
+    let evt: ProcessCreateEvent = unsafe { read_packed_event(buf, size, "ProcessCreate")? };
     let pid = evt.process_id;
     let ppid = evt.parent_process_id;
     let cpid = evt.creating_process_id;
@@ -307,8 +310,9 @@ fn print_registry_modify(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<()
     let val_len = evt.value_name_len as usize;
     let prev_len = evt.data_preview_len as usize;
 
-    let key_path =
-        unsafe { decode_packed_path::<REGISTRY_KEY_PATH_MAX>(ptr::addr_of!(evt.key_path), key_len) };
+    let key_path = unsafe {
+        decode_packed_path::<REGISTRY_KEY_PATH_MAX>(ptr::addr_of!(evt.key_path), key_len)
+    };
 
     // Empty / default value name renders as "(default)" — that is the
     // convention `regedit` uses for the unnamed value of a key.
@@ -316,10 +320,7 @@ fn print_registry_modify(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<()
         String::from("(default)")
     } else {
         unsafe {
-            decode_packed_path::<REGISTRY_VALUE_NAME_MAX>(
-                ptr::addr_of!(evt.value_name),
-                val_len,
-            )
+            decode_packed_path::<REGISTRY_VALUE_NAME_MAX>(ptr::addr_of!(evt.value_name), val_len)
         }
     };
 
@@ -452,7 +453,10 @@ fn decode_process_access(mask: u32) -> String {
         (PROCESS_CREATE_PROCESS, "CREATE_PROCESS"),
         (PROCESS_QUERY_INFORMATION, "QUERY_INFORMATION"),
         (PROCESS_SUSPEND_RESUME, "SUSPEND_RESUME"),
-        (PROCESS_QUERY_LIMITED_INFORMATION, "QUERY_LIMITED_INFORMATION"),
+        (
+            PROCESS_QUERY_LIMITED_INFORMATION,
+            "QUERY_LIMITED_INFORMATION",
+        ),
         (SYNCHRONIZE, "SYNCHRONIZE"),
     ];
 
@@ -481,11 +485,7 @@ fn decode_process_access(mask: u32) -> String {
     }
 }
 
-fn print_process_handle_access(
-    buf: &[u8],
-    size: u32,
-    ctx: &EventCtx<'_>,
-) -> Result<(), String> {
+fn print_process_handle_access(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
     let evt: ProcessHandleAccessEvent =
         unsafe { read_packed_event(buf, size, "ProcessHandleAccess")? };
     let src = evt.source_process_id;

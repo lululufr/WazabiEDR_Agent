@@ -34,4 +34,4 @@
 pub mod file;
 pub mod writer;
 
-pub use writer::{SpoolConfig, SpoolHandle, spawn_writer};
+pub use writer::{SpoolConfig, SpoolHandle, SpoolSubmitter, spawn_writer};

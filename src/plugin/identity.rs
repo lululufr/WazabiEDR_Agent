@@ -205,8 +205,7 @@ pub fn sha256_file_hex(path: &std::path::Path) -> std::io::Result<String> {
         }
 
         let mut digest = [0u8; 32];
-        let status =
-            unsafe { BCryptFinishHash(hash, digest.as_mut_ptr(), digest.len() as u32, 0) };
+        let status = unsafe { BCryptFinishHash(hash, digest.as_mut_ptr(), digest.len() as u32, 0) };
         unsafe {
             BCryptDestroyHash(hash);
             BCryptCloseAlgorithmProvider(alg, 0);

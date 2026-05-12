@@ -47,14 +47,13 @@ use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use crate::plugin::identity::{
     ClientIdentity, identify_client, sha256_file_hex, verify_authenticode,
 };
-use crate::plugin::manifest::{
-    ManifestStore, PluginManifest, directory_fingerprint, paths_match,
-};
+use crate::plugin::manifest::{ManifestStore, PluginManifest, directory_fingerprint, paths_match};
 use crate::plugin::protocol::{
     ClientFrame, Event, Hello, HelloAck, MAX_FRAME_BYTES, RejectReason, SCHEMA_VERSION,
     ServerFrame, read_frame, write_frame, write_reject,
 };
 use crate::shutdown::SHUTDOWN;
+use crate::spool::SpoolSubmitter;
 use crate::util::strings::to_wide_nul;
 
 /// The pipe path. Plugins connect to `\\.\pipe\WazabiEDR_plugin`.
@@ -160,13 +159,21 @@ impl PluginServerHandle {
 
 /// Spawn the accept loop and the manifest-reload thread. Returns
 /// immediately. `manifest_dir` is where the agent looks for plugin
-/// manifests on disk.
+/// manifests on disk. `spool` is the optional sink for ingested plugin
+/// events — when `Some`, every accepted event is persisted as NDJSON
+/// to that spool. `console_output` mirrors the agent-side flag: when
+/// `false`, plugin events are NOT echoed to stdout (spool only); the
+/// `[plugin] ...` diagnostic lines on stderr are unaffected.
 ///
 /// Two background threads result:
 /// - `wedr-plugin-accept` — pipe accept loop + per-session worker spawn
 /// - `wedr-plugin-reload` — periodic re-scan of `manifest_dir`, swaps
 ///   the live store atomically when it detects a change.
-pub fn spawn_server(manifest_dir: PathBuf) -> io::Result<PluginServerHandle> {
+pub fn spawn_server(
+    manifest_dir: PathBuf,
+    spool: Option<SpoolSubmitter>,
+    console_output: bool,
+) -> io::Result<PluginServerHandle> {
     let stats = Arc::new(PluginStats::default());
 
     // Initial manifest load — failures are tolerated (empty store).
@@ -197,9 +204,18 @@ pub fn spawn_server(manifest_dir: PathBuf) -> io::Result<PluginServerHandle> {
     let accept_store = Arc::clone(&store);
     let accept_stats = Arc::clone(&stats);
     let accept_active = Arc::clone(&active_sessions);
+    let accept_spool = spool.clone();
     let accept_join = thread::Builder::new()
         .name("wedr-plugin-accept".into())
-        .spawn(move || accept_loop(accept_store, accept_stats, accept_active))?;
+        .spawn(move || {
+            accept_loop(
+                accept_store,
+                accept_stats,
+                accept_active,
+                accept_spool,
+                console_output,
+            )
+        })?;
 
     // Reload thread. Spawn fallibly but DON'T fail spawn_server on its
     // failure: the accept loop is the load-bearing path, hot reload is
@@ -243,6 +259,8 @@ fn accept_loop(
     store: Arc<RwLock<Arc<ManifestStore>>>,
     stats: Arc<PluginStats>,
     active_sessions: Arc<AtomicUsize>,
+    spool: Option<SpoolSubmitter>,
+    console_output: bool,
 ) {
     eprintln!("[plugin] server listening on {}", PIPE_NAME);
 
@@ -294,12 +312,19 @@ fn accept_loop(
 
                 let stats_thread = Arc::clone(&stats);
                 let counter = Arc::clone(&active_sessions);
+                let session_spool = spool.clone();
                 let pid_label = stats.sessions_accepted.load(Ordering::Relaxed);
                 let name = format!("wedr-plugin-{:04}", pid_label);
                 let pipe_addr = handle_to_usize(pipe);
                 let spawn_result = thread::Builder::new().name(name).spawn(move || {
                     let pipe = handle_from_usize(pipe_addr);
-                    let _ = handle_session(pipe, &session_store, &stats_thread);
+                    let _ = handle_session(
+                        pipe,
+                        &session_store,
+                        &stats_thread,
+                        session_spool.as_ref(),
+                        console_output,
+                    );
                     unsafe {
                         DisconnectNamedPipe(pipe);
                         CloseHandle(pipe);
@@ -379,11 +404,7 @@ fn stats_loop(stats: Arc<PluginStats>, active: Arc<AtomicUsize>) {
 /// In-flight sessions are unaffected (they hold their own `Arc` to the
 /// previous store). New sessions accepted after the swap see the new
 /// manifests.
-fn reload_loop(
-    dir: PathBuf,
-    store: Arc<RwLock<Arc<ManifestStore>>>,
-    stats: Arc<PluginStats>,
-) {
+fn reload_loop(dir: PathBuf, store: Arc<RwLock<Arc<ManifestStore>>>, stats: Arc<PluginStats>) {
     // Sleep first so we don't immediately rescan the directory we just
     // loaded at startup.
     let mut last_fp = match store.read() {
@@ -541,6 +562,8 @@ fn handle_session(
     pipe: HANDLE,
     store: &ManifestStore,
     stats: &PluginStats,
+    spool: Option<&SpoolSubmitter>,
+    console_output: bool,
 ) -> Result<(), String> {
     let identity = identify_client(pipe).map_err(|e| format!("identity: {}", e))?;
     let mut stream = PipeStream::new(pipe);
@@ -602,7 +625,14 @@ fn handle_session(
         match read_frame(&mut stream) {
             Ok(Some(ClientFrame::Event(ev))) => {
                 stats.events_received.fetch_add(1, Ordering::Relaxed);
-                emit_event(&manifest, &identity, &session_id, &ev);
+                emit_event(
+                    &manifest,
+                    &identity,
+                    &session_id,
+                    &ev,
+                    spool,
+                    console_output,
+                );
             }
             Ok(Some(ClientFrame::Heartbeat(_))) => {
                 // No state to update yet — heartbeat exists so a future
@@ -682,43 +712,114 @@ fn validate_handshake<'a>(
     Ok(manifest)
 }
 
-/// Stamp an event with session attribution and emit it to stdout.
+/// Stamp an event with session attribution and emit it.
 ///
-/// In v1 we only print to stdout for human consumption. Persisting
-/// plugin events to the spool will reuse the existing length-prefixed
-/// framing in a `<spool>/plugins/` subdirectory; that wiring is left
-/// for the next milestone (the spool's framing currently assumes raw
-/// kernel-event bytes, which would conflate kinds in one stream).
+/// One line written to stdout (human-readable feed) and, when a spool
+/// submitter is bound, the same line forwarded into the plugin spool
+/// as NDJSON for the shipper to upload.
+///
+/// We rebuild the JSON object explicitly with `serde_json::Map` rather
+/// than re-serialising the plugin's `Event` struct: it guarantees that
+/// the attribution fields (`plugin_id`, `session_id`, …) come from the
+/// session state and CANNOT be spoofed by anything the plugin stuffed
+/// into its payload. The shape matches the kernel envelope
+/// (`source`/`kind`/`payload` + `ts`) so a single SIEM rule can match
+/// across both sources.
 fn emit_event(
     manifest: &PluginManifest,
     identity: &ClientIdentity,
     session_id: &str,
     ev: &Event,
+    spool: Option<&SpoolSubmitter>,
+    console_output: bool,
 ) {
-    // We rebuild a JSON line ourselves rather than re-serialising via
-    // serde so the attribution fields are guaranteed to come from the
-    // session and not from anything the plugin could have stuffed into
-    // its event payload.
-    //
-    // serde_json::to_string is fine for the user payload; we only have
-    // to be careful that we don't trust event.kind for routing without
-    // sanitising — for now it's logged verbatim with proper escaping.
-    let payload_json = serde_json::to_string(&ev.payload).unwrap_or_else(|_| "null".into());
-    let kind_escaped = serde_json::to_string(&ev.kind).unwrap_or_else(|_| "\"\"".into());
+    // Agent-side wall-clock ingest time. We do NOT trust `ev.ts_unix_ns`
+    // for ordering — the plugin chose it; if its clock is skewed the
+    // shipper's downstream pipeline would mis-order. We still ship it
+    // verbatim as the plugin's claim.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let ts_iso = format_iso8601_ns(now_ns);
 
-    println!(
-        "{{\"plugin_id\":{:?},\"plugin_name\":{:?},\"plugin_pid\":{},\
-         \"session_id\":{:?},\"seq\":{},\"ts_unix_ns\":{},\
-         \"kind\":{},\"payload\":{}}}",
-        manifest.plugin_id,
-        manifest.name,
-        identity.pid,
-        session_id,
-        ev.seq,
-        ev.ts_unix_ns,
-        kind_escaped,
-        payload_json
+    let mut obj = serde_json::Map::with_capacity(10);
+    obj.insert("ts".into(), serde_json::Value::String(ts_iso));
+    obj.insert("ts_unix_ns".into(), serde_json::Value::from(now_ns));
+    obj.insert("source".into(), serde_json::Value::String("plugin".into()));
+    obj.insert("kind".into(), serde_json::Value::String(ev.kind.clone()));
+    obj.insert(
+        "plugin_id".into(),
+        serde_json::Value::String(manifest.plugin_id.clone()),
     );
+    obj.insert(
+        "plugin_name".into(),
+        serde_json::Value::String(manifest.name.clone()),
+    );
+    obj.insert("plugin_pid".into(), serde_json::Value::from(identity.pid));
+    obj.insert(
+        "session_id".into(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    obj.insert("seq".into(), serde_json::Value::from(ev.seq));
+    obj.insert(
+        "plugin_ts_unix_ns".into(),
+        serde_json::Value::from(ev.ts_unix_ns),
+    );
+    obj.insert("payload".into(), ev.payload.clone());
+
+    let mut line = match serde_json::to_vec(&serde_json::Value::Object(obj)) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    line.push(b'\n');
+
+    // stdout for humans, spool for the shipper. stdout failure is
+    // benign (closed pipe in tests / no console attached) — don't let
+    // it stop spool ingest. The console flag gates stdout only —
+    // diagnostic stderr lines are unaffected.
+    if console_output {
+        let _ = std::io::stdout().write_all(&line);
+    }
+    if let Some(s) = spool {
+        let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
+        let _ = s.try_submit(shared);
+    }
+}
+
+/// Format a `u64` nanoseconds-since-Unix-epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ`.
+///
+/// We could pull in `chrono` or `time`, but the formatting only needs
+/// to handle a single, well-defined case (UTC, Gregorian, millisecond
+/// precision) and the project's stance is to avoid date-time crates
+/// when not strictly required. Algorithm: standard "days since
+/// 1970-01-01" → year/month/day decomposition.
+fn format_iso8601_ns(ns: u64) -> String {
+    let total_secs = ns / 1_000_000_000;
+    let ms = ((ns % 1_000_000_000) / 1_000_000) as u32;
+    let secs = (total_secs % 60) as u32;
+    let mins = ((total_secs / 60) % 60) as u32;
+    let hours = ((total_secs / 3600) % 24) as u32;
+    let mut days = (total_secs / 86_400) as i64;
+
+    // Civil-from-days algorithm (Howard Hinnant's date paper). Works
+    // for any reasonable Unix-time value; no leap-second handling
+    // (matches what FILETIME does on Windows).
+    days += 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let doe = (days - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let year = (if m <= 2 { y + 1 } else { y }) as i32;
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, m, d, hours, mins, secs, ms
+    )
 }
 
 /// Generate an opaque, per-session identifier.

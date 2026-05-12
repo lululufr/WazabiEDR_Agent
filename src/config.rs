@@ -1,19 +1,57 @@
-//! Runtime configuration.
+//! Runtime configuration — single source of truth.
 //!
-//! Sources, in increasing priority:
-//!   1. Built-in defaults — see [`AgentConfig::default`].
-//!   2. Environment variables (`WAZABI_*`).
-//!   3. CLI flags (`--spool-dir`, …).
+//! All tunables live in **one JSON file** at
+//! `%ProgramData%\WazabiEDR\agent.json` (Administrators-only ACL at
+//! install time — same trust boundary as the plugin manifest store).
+//! The agent has no CLI flags and no environment variables: a single
+//! place to edit, a single place to audit, no env-var drift across
+//! deployment tooling.
 //!
-//! No external dependency: we parse env + argv by hand. That keeps the
-//! supply-chain footprint of an EDR agent minimal — fewer crates, fewer
-//! review surface, no TOML/JSON parser to audit.
+//! ```json
+//! {
+//!   "agent": {
+//!     "console_output": true,
+//!     "spool_dir": "C:\\ProgramData\\WazabiEDR\\spool",
+//!     "max_bytes_per_file": 1048576,
+//!     "max_age_secs": 10,
+//!     "max_total_bytes": 268435456,
+//!     "channel_capacity": 1024,
+//!     "zstd_level": 3
+//!   },
+//!   "shipper": {
+//!     "url": "https://logs.example.com/wazabi/ingest",
+//!     "token_encrypted_b64": "AQAAANC..."
+//!   }
+//! }
+//! ```
+//!
+//! Both sections are optional:
+//! - missing `agent` ⇒ all defaults below
+//! - missing `shipper` (or `enabled: false`) ⇒ spool-only mode
+//!
+//! Missing the file entirely is fine too: the agent writes a default
+//! skeleton on first start so the operator has something concrete to
+//! edit, then proceeds with the defaults.
 
-use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Resolved configuration for the running agent.
+use serde::Deserialize;
+
+use crate::shipper::config::{ShipperConfig, ShipperSection, resolve_shipper};
+
+/// Default location of the config file: `%ProgramData%\WazabiEDR\agent.json`.
+pub const AGENT_CONFIG_FILE: &str = "WazabiEDR\\agent.json";
+
+/// Resolved configuration handed to `main`.
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    pub agent: AgentConfig,
+    /// `None` means spool-only mode (no upload).
+    pub shipper: Option<ShipperConfig>,
+}
+
+/// Agent-side tunables: spool sizing + console output toggle.
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
     pub spool_dir: PathBuf,
@@ -22,146 +60,191 @@ pub struct AgentConfig {
     pub max_total_bytes: u64,
     pub channel_capacity: usize,
     pub zstd_level: i32,
+    /// Print kernel events (human lines) and plugin events (JSON) to
+    /// stdout. Diagnostic messages (`[agent] ...`, `[plugin] ...`,
+    /// errors) stay on stderr regardless — turning this off makes the
+    /// agent suitable for unattended / service deployment without
+    /// piping stdout into `nul`.
+    pub console_output: bool,
 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        // Spool dir resolves under `%ProgramData%\WazabiEDR\` so
+        // unattended runs (future Windows service) land in a sensible
+        // place, not the CWD.
         Self {
-            spool_dir: PathBuf::from("spool"),
+            spool_dir: default_spool_dir(),
             max_bytes_per_file: 1 * 1024 * 1024,
             max_age: Duration::from_secs(10),
             max_total_bytes: 256 * 1024 * 1024,
             channel_capacity: 1024,
             zstd_level: 3,
+            console_output: true,
         }
     }
 }
 
-impl AgentConfig {
-    /// Build the effective config: defaults overridden by env vars,
-    /// then by CLI args. Returns `Err` only on outright bad input
-    /// (`--spool-dir` with no value, unknown flag, …).
-    pub fn from_env_and_args() -> Result<Self, String> {
-        let mut cfg = Self::default();
-        cfg.apply_env();
-        cfg.apply_args(env::args().skip(1))?;
-        Ok(cfg)
-    }
+/// Raw JSON shape — what serde sees on disk. Every field is optional
+/// so a partial config falls back to defaults instead of refusing to
+/// start.
+#[derive(Deserialize, Default)]
+struct ConfigFile {
+    #[serde(default)]
+    agent: Option<AgentSection>,
+    #[serde(default)]
+    shipper: Option<ShipperSection>,
+}
 
-    /// Pick up overrides from `WAZABI_*` env vars. Silently ignores
-    /// malformed values (logs a warning to stderr) — we'd rather start
-    /// with defaults than refuse to launch an EDR over a typo.
-    fn apply_env(&mut self) {
-        if let Ok(v) = env::var("WAZABI_SPOOL_DIR") {
-            self.spool_dir = PathBuf::from(v);
-        }
-        if let Some(v) = parse_env_u64("WAZABI_MAX_BYTES_PER_FILE") {
-            self.max_bytes_per_file = v;
-        }
-        if let Some(v) = parse_env_u64("WAZABI_MAX_AGE_SECS") {
-            self.max_age = Duration::from_secs(v);
-        }
-        if let Some(v) = parse_env_u64("WAZABI_MAX_TOTAL_BYTES") {
-            self.max_total_bytes = v;
-        }
-        if let Some(v) = parse_env_u64("WAZABI_CHANNEL_CAPACITY") {
-            self.channel_capacity = v as usize;
-        }
-        if let Some(v) = parse_env_i32("WAZABI_ZSTD_LEVEL") {
-            self.zstd_level = v;
-        }
-    }
+#[derive(Deserialize, Default)]
+struct AgentSection {
+    #[serde(default)]
+    console_output: Option<bool>,
+    #[serde(default)]
+    spool_dir: Option<String>,
+    #[serde(default)]
+    max_bytes_per_file: Option<u64>,
+    #[serde(default)]
+    max_age_secs: Option<u64>,
+    #[serde(default)]
+    max_total_bytes: Option<u64>,
+    #[serde(default)]
+    channel_capacity: Option<usize>,
+    #[serde(default)]
+    zstd_level: Option<i32>,
+}
 
-    /// Parse the few CLI flags we care about. `--help` is handled by
-    /// printing usage and exiting; other unknown flags are an error so
-    /// typos can't silently sit on the command line.
-    fn apply_args<I: Iterator<Item = String>>(&mut self, mut args: I) -> Result<(), String> {
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--spool-dir" => {
-                    let v = args
-                        .next()
-                        .ok_or_else(|| "--spool-dir requires a value".to_string())?;
-                    self.spool_dir = PathBuf::from(v);
+pub fn default_path() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    base.join(AGENT_CONFIG_FILE.replace('\\', std::path::MAIN_SEPARATOR_STR))
+}
+
+fn default_spool_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    base.join("WazabiEDR").join("spool")
+}
+
+impl AppConfig {
+    /// Load and resolve the full configuration.
+    ///
+    /// Returns a fully-defaulted [`AppConfig`] (no shipper) if the file
+    /// is absent — and writes a default skeleton at `path` so the next
+    /// run has a concrete file to read (and the operator has something
+    /// to edit). Failure to write the skeleton is not fatal: we log it
+    /// and keep going with in-memory defaults. Returns `Err` only when
+    /// the file exists but is malformed, or when a present-but-invalid
+    /// `shipper` section can't be resolved (missing URL, undecryptable
+    /// token, …). Those are operator mistakes we want loud, not silent.
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(write_err) = write_default_config(path) {
+                    eprintln!(
+                        "[agent] could not write default config {:?}: {} — \
+                         continuing with in-memory defaults",
+                        path, write_err
+                    );
+                } else {
+                    eprintln!("[agent] wrote default config skeleton to {:?}", path);
                 }
-                "--max-bytes-per-file" => {
-                    self.max_bytes_per_file = parse_arg_u64(&mut args, "--max-bytes-per-file")?;
-                }
-                "--max-age-secs" => {
-                    self.max_age =
-                        Duration::from_secs(parse_arg_u64(&mut args, "--max-age-secs")?);
-                }
-                "--max-total-bytes" => {
-                    self.max_total_bytes = parse_arg_u64(&mut args, "--max-total-bytes")?;
-                }
-                "--channel-capacity" => {
-                    self.channel_capacity =
-                        parse_arg_u64(&mut args, "--channel-capacity")? as usize;
-                }
-                "--zstd-level" => {
-                    let raw = args
-                        .next()
-                        .ok_or_else(|| "--zstd-level requires a value".to_string())?;
-                    self.zstd_level = raw
-                        .parse()
-                        .map_err(|_| format!("invalid --zstd-level: {raw}"))?;
-                }
-                "-h" | "--help" => {
-                    print_usage();
-                    std::process::exit(0);
-                }
-                other => {
-                    return Err(format!("unknown flag: {other} (try --help)"));
-                }
+                return Ok(Self {
+                    agent: AgentConfig::default(),
+                    shipper: None,
+                });
             }
-        }
-        Ok(())
+            Err(e) => return Err(format!("read {:?}: {}", path, e)),
+        };
+
+        let parsed: ConfigFile =
+            serde_json::from_slice(&bytes).map_err(|e| format!("parse {:?}: {}", path, e))?;
+
+        let agent = resolve_agent(parsed.agent.unwrap_or_default());
+        let shipper = match parsed.shipper {
+            Some(s) if s.is_enabled() => Some(resolve_shipper(s)?),
+            _ => None,
+        };
+
+        Ok(Self { agent, shipper })
     }
 }
 
-fn parse_env_u64(name: &str) -> Option<u64> {
-    let raw = env::var(name).ok()?;
-    match raw.parse::<u64>() {
-        Ok(v) => Some(v),
-        Err(_) => {
-            eprintln!("[agent] ignoring {name}={raw:?} — not a u64");
-            None
-        }
+fn resolve_agent(s: AgentSection) -> AgentConfig {
+    let d = AgentConfig::default();
+    AgentConfig {
+        console_output: s.console_output.unwrap_or(d.console_output),
+        spool_dir: s.spool_dir.map(PathBuf::from).unwrap_or(d.spool_dir),
+        max_bytes_per_file: s.max_bytes_per_file.unwrap_or(d.max_bytes_per_file),
+        max_age: s.max_age_secs.map(Duration::from_secs).unwrap_or(d.max_age),
+        max_total_bytes: s.max_total_bytes.unwrap_or(d.max_total_bytes),
+        channel_capacity: s.channel_capacity.unwrap_or(d.channel_capacity),
+        zstd_level: s.zstd_level.unwrap_or(d.zstd_level),
     }
 }
 
-fn parse_env_i32(name: &str) -> Option<i32> {
-    let raw = env::var(name).ok()?;
-    match raw.parse::<i32>() {
-        Ok(v) => Some(v),
-        Err(_) => {
-            eprintln!("[agent] ignoring {name}={raw:?} — not an i32");
-            None
-        }
+/// Write a default `agent.json` skeleton at `path`.
+///
+/// Called from [`AppConfig::load`] when the file is missing. Mirrors the
+/// in-memory defaults of [`AgentConfig`] so a freshly-installed agent
+/// has a self-explanatory config on disk, with the `shipper` section
+/// disabled and pre-filled with placeholder values the operator can
+/// edit. Creates the parent directory if needed (`%ProgramData%\WazabiEDR`
+/// won't exist on a clean machine).
+fn write_default_config(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create_dir_all {:?}: {}", parent, e))?;
     }
+
+    let d = AgentConfig::default();
+    let skeleton = serde_json::json!({
+        "_comment": "WazabiEDR agent — auto-generated default config. \
+                     See WazabiEDR_Doc/usage/configuring-shipper.md for the full schema.",
+        "agent": {
+            "console_output": d.console_output,
+            "spool_dir": d.spool_dir.to_string_lossy(),
+            "max_bytes_per_file": d.max_bytes_per_file,
+            "max_age_secs": d.max_age.as_secs(),
+            "max_total_bytes": d.max_total_bytes,
+            "channel_capacity": d.channel_capacity,
+            "zstd_level": d.zstd_level,
+        },
+        "shipper": {
+            "enabled": false,
+            "url": "https://logs.example.com/wazabi/ingest",
+            "token_encrypted_b64": "",
+            "debug": false
+        }
+    });
+
+    let mut content = serde_json::to_string_pretty(&skeleton)
+        .map_err(|e| format!("serialize default config: {}", e))?;
+    content.push('\n');
+
+    std::fs::write(path, content).map_err(|e| format!("write {:?}: {}", path, e))
 }
 
-fn parse_arg_u64<I: Iterator<Item = String>>(args: &mut I, flag: &str) -> Result<u64, String> {
-    let raw = args
-        .next()
-        .ok_or_else(|| format!("{flag} requires a value"))?;
-    raw.parse()
-        .map_err(|_| format!("invalid {flag}: {raw}"))
-}
-
-fn print_usage() {
+/// Print a short message explaining where the config file lives and
+/// exit. Called from `main` when any CLI argument is supplied — the
+/// agent has no flags anymore.
+pub fn print_help_and_exit() -> ! {
     eprintln!(
-        "WazabiEDR agent — connects to \\\\.\\WazabiEDR and spools events.\n\
+        "WazabiEDR agent — single-file configuration.\n\
          \n\
-         Usage: WazabiEDR_Agent [FLAGS]\n\
+         The agent takes no CLI flags. All tunables live in:\n  \
+           {}\n\
          \n\
-         Flags (each also takes a WAZABI_* env var of the same shape):\n\
-           --spool-dir <PATH>              spool directory (default: ./spool)\n\
-           --max-bytes-per-file <BYTES>    rotate active file at this size\n\
-           --max-age-secs <SECS>           rotate active file at this age\n\
-           --max-total-bytes <BYTES>       evict oldest batches above this cap\n\
-           --channel-capacity <N>          pump→writer queue size\n\
-           --zstd-level <1..22>            sealed-batch compression level\n\
-           -h, --help                      print this help and exit"
+         See WazabiEDR_Doc/usage/configuring-shipper.md for the full schema.\n\
+         Minimal example (spool-only, no upload):\n\
+         \n\
+         {{\n  \
+           \"agent\": {{ \"console_output\": true }}\n\
+         }}",
+        default_path().display()
     );
+    std::process::exit(0);
 }

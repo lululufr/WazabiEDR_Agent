@@ -147,10 +147,7 @@ pub fn spawn_supervisor(manifest_dir: PathBuf) -> SupervisorHandle {
         threads.push(h);
     }
 
-    eprintln!(
-        "[supervisor] auto-launched {} plugin(s)",
-        candidates.len()
-    );
+    eprintln!("[supervisor] auto-launched {} plugin(s)", candidates.len());
     SupervisorHandle {
         threads,
         spawned_count: candidates.len(),
@@ -160,11 +157,7 @@ pub fn spawn_supervisor(manifest_dir: PathBuf) -> SupervisorHandle {
 /// Single-plugin supervisor loop: spawn → wait → backoff → repeat,
 /// until `SHUTDOWN` flips.
 fn supervise_one(manifest: PluginManifest) {
-    let label = format!(
-        "{} ({})",
-        manifest.name,
-        short_id(&manifest.plugin_id)
-    );
+    let label = format!("{} ({})", manifest.name, short_id(&manifest.plugin_id));
     let mut backoff = INITIAL_BACKOFF;
 
     while !SHUTDOWN.load(Ordering::Acquire) {
@@ -215,10 +208,7 @@ fn supervise_one(manifest: PluginManifest) {
             backoff = INITIAL_BACKOFF;
         }
 
-        eprintln!(
-            "[supervisor] {} — restarting in {:?}",
-            label, backoff
-        );
+        eprintln!("[supervisor] {} — restarting in {:?}", label, backoff);
         if !sleep_with_shutdown(backoff) {
             return;
         }
@@ -282,7 +272,11 @@ fn sleep_with_shutdown(dur: Duration) -> bool {
 /// `1s → 2s → 4s → 8s → 16s → 32s → 60s (cap)`.
 fn next_backoff(prev: Duration) -> Duration {
     let next = prev.saturating_mul(2);
-    if next > MAX_BACKOFF { MAX_BACKOFF } else { next }
+    if next > MAX_BACKOFF {
+        MAX_BACKOFF
+    } else {
+        next
+    }
 }
 
 /// First 8 hex chars of the plugin_id — keeps log lines readable while

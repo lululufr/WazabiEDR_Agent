@@ -3,4 +3,5 @@
 
 pub mod device;
 pub mod events;
+pub mod json;
 pub mod parser;

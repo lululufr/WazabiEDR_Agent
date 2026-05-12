@@ -1,32 +1,25 @@
 //! Background writer thread.
 //!
-//! The kernel pump must never block on disk I/O — if it stalls, events
-//! pile up in the kernel ring and eventually get evicted with a
-//! `drop_count`. So the pump only does a `try_send` over a bounded
-//! channel; this thread is the one that actually touches the disk.
+//! The pump (kernel or plugin) hands an already-serialised NDJSON line
+//! to [`SpoolHandle::try_submit`]; this thread is the one that touches
+//! the disk. The pump never blocks on I/O — `try_submit` is non-blocking
+//! and accounts dropped events on a full channel.
 //!
 //! # Pipeline
 //!
 //! ```text
-//!  pump → mpsc::sync_channel(N) → writer thread → active.bin → batch-*.zst
+//!  caller → mpsc::sync_channel(N) → writer thread
+//!                                     → active.ndjson  →  batch-<ts>-<seq>.zst
 //! ```
-//!
-//! # Drop policy
-//!
-//! Channel full = writer fell behind = drop the event and bump a counter.
-//! The kernel already has its own drop counter; layering ours on top
-//! gives us per-side visibility (was the event lost in the kernel ring,
-//! or did the agent itself drop it?).
 //!
 //! # Rotation
 //!
-//! We rotate the active file when *either* of these triggers fires,
-//! whichever comes first:
-//! - the file has reached `max_bytes` (default 1 MiB)
-//! - the file is older than `max_age` (default 10 s)
+//! The active file is sealed when *either* trigger fires:
+//! - it reached `max_bytes` (default 1 MiB), or
+//! - it is older than `max_age` (default 10 s).
 //!
 //! Time-based rotation matters because a quiet endpoint would otherwise
-//! never seal a batch — the uploader would have nothing to ship.
+//! never seal a batch — the shipper would have nothing to send.
 
 use std::fs;
 use std::io;
@@ -46,10 +39,14 @@ use crate::spool::file::ActiveFile;
 /// scheduler alone.
 const MIN_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// File name we use for the in-flight active file. `.ndjson` makes the
+/// content obvious to a human walking the spool directory.
+const ACTIVE_FILE_NAME: &str = "active.ndjson";
+
 /// Tunables for the spool subsystem.
 #[derive(Clone, Debug)]
 pub struct SpoolConfig {
-    /// Directory where `active.bin` and `batch-*.zst` live.
+    /// Directory where `active.ndjson` and `batch-*.zst` live.
     pub dir: PathBuf,
     /// Rotate the active file when it reaches this many bytes.
     pub max_bytes_per_file: u64,
@@ -60,18 +57,18 @@ pub struct SpoolConfig {
     /// Hard cap on the total size of sealed batches in `dir`. Oldest
     /// batches get evicted when this is exceeded.
     pub max_total_bytes: u64,
-    /// Bounded channel capacity. Once full, the pump drops events
+    /// Bounded channel capacity. Once full, the producer drops events
     /// (recorded under `events_dropped`).
     pub channel_capacity: usize,
     /// zstd compression level — 1 (fast) to 22 (slow). Level 3 is the
-    /// "default" trade-off and matches what most production logging
+    /// default trade-off and matches what most production logging
     /// pipelines use.
     pub zstd_level: i32,
 }
 
-/// Counters published by the writer thread. The pump increments
-/// `events_dropped` directly when its `try_send` fails; everything else
-/// is the writer's job.
+/// Counters published by the writer thread. `events_dropped` is bumped
+/// both from `try_submit` (channel full) and from inside the writer
+/// (write error) — both mean "an event we wanted is gone."
 #[derive(Default)]
 pub struct SpoolStats {
     pub events_written: AtomicU64,
@@ -81,29 +78,24 @@ pub struct SpoolStats {
 }
 
 /// Front-end handle returned by [`spawn_writer`].
-///
-/// The pump loop only ever uses [`Self::try_submit`] + [`Self::is_alive`];
-/// [`Self::shutdown`] is called by `main` after the pump exits.
 pub struct SpoolHandle {
     sender: SyncSender<Arc<[u8]>>,
     join: Option<JoinHandle<()>>,
     stats: Arc<SpoolStats>,
-    /// Set to `true` while the writer thread is running. Flips to
-    /// `false` if the thread exits early (failed setup, fatal write
-    /// error). The pump checks it to surface the issue exactly once.
+    /// `true` while the writer thread is running. Flips to `false` if
+    /// the thread exits early (failed setup, fatal write error). The
+    /// caller checks it to surface the issue exactly once.
     alive: Arc<AtomicBool>,
 }
 
 impl SpoolHandle {
-    /// Submit one raw event payload to the writer thread.
+    /// Submit one NDJSON line (must already contain the trailing `\n`).
     ///
-    /// Takes the payload by `Arc<[u8]>` so the pump can hand off
-    /// ownership without copying the bytes again. Returns `false` when
-    /// the channel is full (the writer fell behind). The pump should
-    /// NOT block — losing an event is far better than stalling the
-    /// kernel queue.
-    pub fn try_submit(&self, payload: Arc<[u8]>) -> bool {
-        match self.sender.try_send(payload) {
+    /// Non-blocking. Returns `false` when the channel is full so the
+    /// caller can update its own counter if it cares about the
+    /// kernel-side vs. agent-side breakdown.
+    pub fn try_submit(&self, line: Arc<[u8]>) -> bool {
+        match self.sender.try_send(line) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
@@ -112,27 +104,15 @@ impl SpoolHandle {
         }
     }
 
-    /// Read-only view onto the running counters.
     pub fn stats(&self) -> &SpoolStats {
         &self.stats
     }
 
-    /// `true` while the writer thread is processing events. `false` once
-    /// it has exited (shutdown OR fatal error). The pump uses this to
-    /// log a one-shot warning when the writer dies underneath it.
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
 
-    /// Drop the sender (so the writer sees `RecvError` and exits) and
-    /// join the thread. Idempotent in the sense that calling it twice
-    /// is a logic bug, not a memory bug — `Option::take` makes the
-    /// second call a no-op.
     pub fn shutdown(mut self) {
-        // Replace our SyncSender with one that's immediately dropped,
-        // so the thread's recv side wakes up. We can't drop `self.sender`
-        // by name because it's behind `&mut self` — swap with a fresh
-        // closed-channel sender.
         let (dummy, _) = sync_channel::<Arc<[u8]>>(1);
         let real_sender = std::mem::replace(&mut self.sender, dummy);
         drop(real_sender);
@@ -140,15 +120,43 @@ impl SpoolHandle {
             let _ = j.join();
         }
     }
+
+    /// Cheap, cloneable producer end. Hand this to threads that only
+    /// need to submit (the plugin workers do — they don't own the
+    /// writer thread's lifecycle).
+    pub fn submitter(&self) -> SpoolSubmitter {
+        SpoolSubmitter {
+            sender: self.sender.clone(),
+            stats: Arc::clone(&self.stats),
+        }
+    }
 }
 
-/// Spawn the writer thread and return a handle for the pump.
-///
-/// Returns `Err` only if the OS refuses to spawn a thread (essentially
-/// "out of memory" — at which point starting an EDR agent is futile
-/// anyway). Setup failures *inside* the thread (cannot create the spool
-/// dir, etc.) are not propagated here: the thread exits, the `alive`
-/// flag flips to `false`, and the pump notices on its next iteration.
+/// Clone-friendly view onto a [`SpoolHandle`] for code that only needs
+/// to push events. Holding a `SpoolSubmitter` does NOT keep the writer
+/// thread alive — `shutdown()` on the parent handle still drops the
+/// real sender and lets the thread exit cleanly.
+#[derive(Clone)]
+pub struct SpoolSubmitter {
+    sender: SyncSender<Arc<[u8]>>,
+    stats: Arc<SpoolStats>,
+}
+
+impl SpoolSubmitter {
+    pub fn try_submit(&self, line: Arc<[u8]>) -> bool {
+        match self.sender.try_send(line) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+}
+
+/// Spawn the writer thread and return a handle. Multiple spools can run
+/// side by side as long as their `dir` is distinct (the kernel and
+/// plugin spools take advantage of this).
 pub fn spawn_writer(config: SpoolConfig) -> io::Result<SpoolHandle> {
     let stats = Arc::new(SpoolStats::default());
     let alive = Arc::new(AtomicBool::new(true));
@@ -156,12 +164,19 @@ pub fn spawn_writer(config: SpoolConfig) -> io::Result<SpoolHandle> {
 
     let stats_for_thread = Arc::clone(&stats);
     let alive_for_thread = Arc::clone(&alive);
-    let join = thread::Builder::new()
-        .name("wedr-spool".into())
-        .spawn(move || {
-            writer_main(receiver, config, stats_for_thread);
-            alive_for_thread.store(false, Ordering::Release);
-        })?;
+    // Thread name carries the basename of the dir so two concurrent
+    // spools are distinguishable in a debugger / `Get-Process` view.
+    let dir_tag = config
+        .dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("spool")
+        .to_string();
+    let thread_name = format!("wedr-spool-{}", dir_tag);
+    let join = thread::Builder::new().name(thread_name).spawn(move || {
+        writer_main(receiver, config, stats_for_thread);
+        alive_for_thread.store(false, Ordering::Release);
+    })?;
 
     Ok(SpoolHandle {
         sender,
@@ -171,17 +186,17 @@ pub fn spawn_writer(config: SpoolConfig) -> io::Result<SpoolHandle> {
     })
 }
 
-/// Writer thread entry point. Owns the active file and rotates it.
 fn writer_main(rx: Receiver<Arc<[u8]>>, cfg: SpoolConfig, stats: Arc<SpoolStats>) {
     if let Err(e) = fs::create_dir_all(&cfg.dir) {
         eprintln!("[spool] failed to create dir {:?}: {}", cfg.dir, e);
         return;
     }
 
-    // Always start fresh: any leftover active.bin from a previous run
-    // is considered lost. Recovering it cleanly would require parsing
-    // partial framing, which isn't worth the complexity yet.
-    let active_path = cfg.dir.join("active.bin");
+    // Always start fresh: any leftover active file is considered lost.
+    // Recovering partial NDJSON cleanly would mean parsing the tail to
+    // find the last newline — easy, but the durability contract is
+    // "agent crash loses a few seconds" so we don't bother.
+    let active_path = cfg.dir.join(ACTIVE_FILE_NAME);
     let _ = fs::remove_file(&active_path);
 
     let mut active = match ActiveFile::create(&active_path) {
@@ -194,56 +209,45 @@ fn writer_main(rx: Receiver<Arc<[u8]>>, cfg: SpoolConfig, stats: Arc<SpoolStats>
     let mut active_started_at = Instant::now();
 
     loop {
-        // Wait for the next event OR the time-based rotation deadline,
-        // whichever fires first. Clamp to MIN_RECV_TIMEOUT so a stale
-        // `active_started_at` (or NTP step backwards) cannot collapse
-        // the wait to zero and busy-loop the writer at 100 % CPU.
         let elapsed = active_started_at.elapsed();
         let timeout = cfg.max_age.saturating_sub(elapsed).max(MIN_RECV_TIMEOUT);
 
         match rx.recv_timeout(timeout) {
-            Ok(payload) => {
+            Ok(line) => {
                 let f = match active.as_mut() {
                     Some(f) => f,
                     None => {
-                        // No active file (creation failed earlier);
-                        // count the drop and try again on next tick.
                         stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                 };
 
-                if let Err(e) = f.write_event(&payload) {
+                if let Err(e) = f.write_line(&line) {
                     eprintln!("[spool] write failed, dropping event: {}", e);
                     stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 stats.events_written.fetch_add(1, Ordering::Relaxed);
 
-                // Size-based rotation trigger. We let writes through
-                // first so a single huge event never gets stuck waiting
-                // for a rotation that hasn't happened yet.
                 if f.bytes_written() >= cfg.max_bytes_per_file {
                     rotate(&mut active, &cfg, &stats, &active_path);
                     active_started_at = Instant::now();
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                // Time-based rotation. Skip if the active file only has
-                // the header in it (no events) — sealing an empty batch
-                // wastes both the rotation cost and the uploader's slot.
+                // Skip rotation when the active file is empty — sealing
+                // an empty batch wastes both the rotation cost and the
+                // shipper's bandwidth.
                 if let Some(f) = active.as_ref() {
-                    if f.bytes_written() > crate::spool::file::HEADER_LEN {
+                    if f.bytes_written() > 0 {
                         rotate(&mut active, &cfg, &stats, &active_path);
                     }
                 }
                 active_started_at = Instant::now();
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // Pump has hung up — finalise whatever is in the active
-                // file (if non-empty) and exit cleanly.
                 if let Some(f) = active.take() {
-                    if f.bytes_written() > crate::spool::file::HEADER_LEN {
+                    if f.bytes_written() > 0 {
                         let _ = seal_active_file(f, &cfg, &stats, &active_path);
                     } else {
                         let _ = f.finish();
@@ -256,9 +260,6 @@ fn writer_main(rx: Receiver<Arc<[u8]>>, cfg: SpoolConfig, stats: Arc<SpoolStats>
     }
 }
 
-/// Replace the active file: seal the current one (if any) and open a
-/// fresh empty `active.bin`. On error we drop the active file slot —
-/// next event arriving will count as dropped, the writer keeps running.
 fn rotate(
     active: &mut Option<ActiveFile>,
     cfg: &SpoolConfig,
@@ -268,9 +269,6 @@ fn rotate(
     if let Some(f) = active.take() {
         if let Err(e) = seal_active_file(f, cfg, stats, active_path) {
             eprintln!("[spool] failed to seal batch: {}", e);
-            // active_path may or may not still exist depending on where
-            // sealing failed. Try to clean up so create() below doesn't
-            // append into a partially-sealed file.
             let _ = fs::remove_file(active_path);
         }
     }
@@ -283,7 +281,7 @@ fn rotate(
     }
 }
 
-/// Seal the (already-flushed) active file: rename → compress → unlink.
+/// Seal the active file: rename → compress → unlink staging.
 ///
 /// We rename first so concurrent inspection of the spool directory
 /// never sees a `batch-*.zst` whose content is still being written.
@@ -295,22 +293,16 @@ fn seal_active_file(
 ) -> std::io::Result<()> {
     file.finish()?;
 
-    // Pick a unique sealed name. Combining a unix timestamp with a
-    // monotonic-ish suffix avoids collisions when multiple rotations
-    // happen within the same second (e.g. burst of large events).
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let seq = stats.batches_sealed.fetch_add(1, Ordering::Relaxed);
-    let staging = cfg.dir.join(format!("batch-{}-{}.bin", ts, seq));
+    let staging = cfg.dir.join(format!("batch-{}-{}.ndjson", ts, seq));
     let final_path = cfg.dir.join(format!("batch-{}-{}.zst", ts, seq));
 
     fs::rename(active_path, &staging)?;
 
-    // Compress the staged file. We deliberately read from disk rather
-    // than from memory: keeping ~1 MiB of bytes in RAM during sealing
-    // would double the agent's resident set under bursty load.
     let input = fs::File::open(&staging)?;
     let output = fs::File::create(&final_path)?;
     let mut encoder = zstd::stream::Encoder::new(output, cfg.zstd_level)?;
@@ -318,21 +310,15 @@ fn seal_active_file(
     std::io::copy(&mut reader, &mut encoder)?;
     encoder.finish()?;
 
-    // Drop the uncompressed staging file — keeping it around would
-    // double on-disk usage for no benefit (the .zst is the canonical
-    // form, the staging file is post-rename of active.bin only because
-    // we need a stable name during compression).
     let _ = fs::remove_file(&staging);
 
-    // Now that we've added a new batch, evict old ones if we're over
-    // budget. Doing it on every rotation amortises the cost.
     enforce_total_size_cap(cfg, stats);
     Ok(())
 }
 
 /// Delete oldest `batch-*.zst` files until total size is under budget.
 ///
-/// "Oldest" = smallest `(timestamp, seq)` filename pair, which is the
+/// "Oldest" = smallest `(timestamp, seq)` filename pair, which IS the
 /// rotation order. Sorting by mtime would be wrong: clock skew or NTP
 /// jumps could reorder things relative to the actual sequence.
 fn enforce_total_size_cap(cfg: &SpoolConfig, stats: &SpoolStats) {
@@ -341,8 +327,6 @@ fn enforce_total_size_cap(cfg: &SpoolConfig, stats: &SpoolStats) {
         Err(_) => return,
     };
 
-    // Collect (filename, size) for sealed batches. We can't compute
-    // total size without listing, so might as well do it once.
     let mut batches: Vec<(PathBuf, u64)> = Vec::new();
     let mut total: u64 = 0;
     for entry in entries.flatten() {
@@ -363,8 +347,6 @@ fn enforce_total_size_cap(cfg: &SpoolConfig, stats: &SpoolStats) {
         return;
     }
 
-    // Sort lexicographically by filename — works because the `batch-<ts>-<seq>`
-    // prefix is monotonic per writer instance. Ascending = oldest first.
     batches.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (path, size) in batches {
