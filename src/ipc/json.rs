@@ -35,17 +35,40 @@ use crate::ipc::events::{
 };
 use crate::util::time::format_timestamp;
 
-/// Shape produced by [`encode_kernel_event`]. Stable: every consumer
-/// downstream (spool reader, log server, dashboards) keys off these
-/// field names.
+/// Shape produced by [`encode_kernel_event`]. Aligned with the Wazabi
+/// Server `EventIn` Pydantic schema (`WazabiEDR_Server/app/schemas/event.py`)
+/// so each NDJSON line POSTed to `/api/v1/agents/{agent_id}/logs` parses
+/// without validation errors and is indexed into OpenSearch
+/// `wazabi-events`.
+///
+/// Required-by-server fields: `ts`, `module`, `event_type`. The server
+/// also recognises a top-level `process` (`ProcessInfo`) which we hoist
+/// out of the kernel payload when relevant. Everything else lives in
+/// `raw` — Pydantic is configured with `extra="allow"` so the server
+/// also keeps the verbatim agent-side fields (`ts_ft_100ns`, `source`,
+/// `kind`, `event_version`, `drop_count`, `trunc_count`) for forensics.
 ///
 /// `source` is always `"kernel"` here. The plugin-side encoder produces
-/// the same envelope with `source: "plugin"` (see `plugin/server.rs`)
-/// so a single index in the log backend can hold both.
+/// the same envelope with `source: "plugin"` and its own
+/// `module`/`event_type` mapping (see `plugin/server.rs`).
 #[derive(Serialize)]
 struct KernelEnvelope<'a> {
     /// ISO-8601 UTC, derived from the kernel FILETIME in the header.
     ts: String,
+    /// Maps to the server's `AgentModule` enum — always
+    /// `"kernel_callback"` for events sourced from the driver.
+    module: &'static str,
+    /// Maps to the server's `EventType` enum (snake_case). Built from
+    /// the kernel event type code.
+    event_type: &'static str,
+    /// Process context hoisted out of the kernel payload when the event
+    /// has one. Matches the server's `ProcessInfo` shape (`pid`, `ppid`,
+    /// `path`). Skipped entirely for events without a process scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process: Option<ProcessSlim>,
+    /// All other kernel-specific fields (registry op, image base,
+    /// handle access, …). The server stores it as-is in OpenSearch.
+    raw: &'a serde_json::Value,
     /// Kept verbatim so reorder under clock skew is debuggable.
     ts_ft_100ns: i64,
     source: &'static str,
@@ -60,11 +83,45 @@ struct KernelEnvelope<'a> {
     /// since the previous delivered event. Same skip-zero treatment.
     #[serde(skip_serializing_if = "is_zero_u32")]
     trunc_count: u32,
-    payload: &'a serde_json::Value,
+}
+
+/// Server-shaped subset of `ProcessInfo` that the kernel actually knows
+/// about. Filled by [`extract_process`] from the per-event payloads.
+#[derive(Serialize)]
+struct ProcessSlim {
+    pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ppid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+/// Pull a server-compatible `process` block out of the kernel payload
+/// when it carries one. Kernel callbacks always identify a process (or
+/// a thread inside one) by `pid`, sometimes with `parent_pid` and
+/// `image_path` — that's all the server's `ProcessInfo` can absorb at
+/// this layer. PID 0 is the System Idle process / kernel scope, not a
+/// real target — skip it so the server-side `ProcessInfo.pid` stays
+/// meaningful for actual user-mode processes.
+fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
+    let pid = payload.get("pid").and_then(|v| v.as_u64())? as u32;
+    if pid == 0 {
+        return None;
+    }
+    let ppid = payload
+        .get("parent_pid")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let path = payload
+        .get("image_path")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    Some(ProcessSlim { pid, ppid, path })
 }
 
 /// Encode one raw kernel event into a single-line JSON document.
@@ -100,31 +157,71 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    let (kind, payload) = match h_type {
-        EVENT_TYPE_PROCESS_CREATE => ("ProcessCreate", encode_process_create(buf, h_size)?),
-        EVENT_TYPE_PROCESS_EXIT => ("ProcessExit", encode_process_exit(buf, h_size)?),
-        EVENT_TYPE_IMAGE_LOAD => ("ImageLoad", encode_image_load(buf, h_size)?),
-        EVENT_TYPE_REGISTRY_MODIFY => ("RegistryModify", encode_registry(buf, h_size)?),
-        EVENT_TYPE_THREAD_CREATE => ("ThreadCreate", encode_thread_create(buf, h_size)?),
-        EVENT_TYPE_THREAD_EXIT => ("ThreadExit", encode_thread_exit(buf, h_size)?),
-        EVENT_TYPE_PROCESS_HANDLE_ACCESS => {
-            ("ProcessHandleAccess", encode_handle_access(buf, h_size)?)
-        }
+    // (kind, event_type, payload) — `kind` is the historical agent-side
+    // label kept in the envelope for debug; `event_type` is the
+    // server-side `EventType` enum value (snake_case) routed straight
+    // through to OpenSearch. The two stay in sync deliberately: changing
+    // either side without the other will cause server-side parse
+    // failures or break human pretty-printing. "Unknown" maps to
+    // `process_create` as a least-bad fallback rather than a fabricated
+    // type the server's enum would reject.
+    let (kind, event_type, payload) = match h_type {
+        EVENT_TYPE_PROCESS_CREATE => (
+            "ProcessCreate",
+            "process_create",
+            encode_process_create(buf, h_size)?,
+        ),
+        EVENT_TYPE_PROCESS_EXIT => (
+            "ProcessExit",
+            "process_terminate",
+            encode_process_exit(buf, h_size)?,
+        ),
+        EVENT_TYPE_IMAGE_LOAD => (
+            "ImageLoad",
+            "module_load",
+            encode_image_load(buf, h_size)?,
+        ),
+        EVENT_TYPE_REGISTRY_MODIFY => (
+            "RegistryModify",
+            "registry_write",
+            encode_registry(buf, h_size)?,
+        ),
+        EVENT_TYPE_THREAD_CREATE => (
+            "ThreadCreate",
+            "thread_create",
+            encode_thread_create(buf, h_size)?,
+        ),
+        EVENT_TYPE_THREAD_EXIT => (
+            "ThreadExit",
+            "thread_exit",
+            encode_thread_exit(buf, h_size)?,
+        ),
+        EVENT_TYPE_PROCESS_HANDLE_ACCESS => (
+            "ProcessHandleAccess",
+            "process_handle_access",
+            encode_handle_access(buf, h_size)?,
+        ),
         other => (
             "Unknown",
+            "process_create",
             serde_json::json!({ "type": other, "size": h_size }),
         ),
     };
 
+    let process = extract_process(&payload);
+
     let env = KernelEnvelope {
         ts: format_timestamp(h_timestamp),
+        module: "kernel_callback",
+        event_type,
+        process,
+        raw: &payload,
         ts_ft_100ns: h_timestamp,
         source: "kernel",
         kind,
         event_version: h_version,
         drop_count: h_drop,
         trunc_count: h_trunc,
-        payload: &payload,
     };
 
     let mut out = serde_json::to_vec(&env).map_err(|e| format!("serialize: {e}"))?;
