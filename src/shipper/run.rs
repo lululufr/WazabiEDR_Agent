@@ -8,7 +8,7 @@
 //!     batch = oldest batch-*.zst across all watched dirs (or None)
 //!     match batch:
 //!         None     → sleep poll_interval
-//!         Some(b)  → POST b
+//!         Some(b)  → decompress in RAM → POST as NDJSON
 //!                    on 2xx          → delete b, reset backoff
 //!                    on 4xx          → log once, leave on disk, sleep poll_interval
 //!                    on 5xx/network  → sleep backoff (capped), do NOT delete
@@ -18,6 +18,18 @@
 //! mismatches the operator needs to diagnose, and the spool's
 //! `max_total_bytes` cap will evict them naturally if the situation
 //! persists. Retrying them indefinitely would burn CPU without value.
+//!
+//! # Why decompress before POST
+//!
+//! Wazabi Server reads `POST /api/v1/agents/{agent_id}/logs` body as a
+//! raw byte stream and splits on `\n` to validate each line against the
+//! `EventIn` Pydantic schema (see `WazabiEDR_Server/app/routers/agents.py`).
+//! It does NOT honour `Content-Encoding: zstd` — sending the `.zst`
+//! verbatim would make every line parse-fail and the batch would be
+//! 4xx-rejected. We therefore zstd-decode in memory before each POST.
+//! The on-disk format stays compressed; the cost of one in-memory
+//! `decode_all` per batch is negligible at the shipper's throughput
+//! target (~1 batch / 10 s).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,9 +115,10 @@ fn shipper_main(
         );
     }
 
+    let endpoint = cfg.logs_endpoint();
     eprintln!(
         "[shipper] started — endpoint: {} — watching {} dir(s)",
-        cfg.url,
+        endpoint,
         dirs.len()
     );
 
@@ -113,7 +126,7 @@ fn shipper_main(
 
     while !SHUTDOWN.load(Ordering::Acquire) {
         match oldest_batch(&dirs) {
-            Some(path) => match send_one(&agent, &cfg, &path) {
+            Some(path) => match send_one(&agent, &cfg, &endpoint, &path) {
                 Outcome::Ok => {
                     let _ = fs::remove_file(&path);
                     stats.batches_sent.fetch_add(1, Ordering::Relaxed);
@@ -158,37 +171,31 @@ enum Outcome {
     Retry(String),
 }
 
-fn send_one(agent: &ureq::Agent, cfg: &ShipperConfig, path: &Path) -> Outcome {
+fn send_one(agent: &ureq::Agent, cfg: &ShipperConfig, endpoint: &str, path: &Path) -> Outcome {
     let raw = match fs::read(path) {
         Ok(b) => b,
         Err(e) => return Outcome::Retry(format!("read batch: {e}")),
     };
 
-    // Debug mode: decompress in-memory so the server sees plain NDJSON.
-    // Decode failure is fatal for this batch — a corrupted .zst on disk
-    // would loop forever otherwise, so we surface it as 4xx-equivalent.
-    let body = if cfg.debug {
-        match zstd::stream::decode_all(raw.as_slice()) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!(
-                    "[shipper] debug: zstd decode failed for {:?}: {} — skipping batch",
-                    path, e
-                );
-                return Outcome::Rejected(0);
-            }
+    // Wazabi Server reads /logs as raw NDJSON (no Content-Encoding
+    // negotiation), so we always decompress before POST. A corrupted
+    // .zst on disk would loop forever otherwise — surface it as
+    // 4xx-equivalent so the spool's cap evicts it eventually.
+    let body = match zstd::stream::decode_all(raw.as_slice()) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "[shipper] zstd decode failed for {:?}: {} — skipping batch",
+                path, e
+            );
+            return Outcome::Rejected(0);
         }
-    } else {
-        raw
     };
 
     let mut req = agent
-        .post(&cfg.url)
+        .post(endpoint)
         .set("Content-Type", "application/x-ndjson")
         .set("Authorization", &format!("Bearer {}", cfg.token));
-    if !cfg.debug {
-        req = req.set("Content-Encoding", "zstd");
-    }
 
     if let Some(tenant) = &cfg.tenant_id {
         req = req.set("X-Wazabi-Tenant", tenant);

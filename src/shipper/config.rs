@@ -3,13 +3,21 @@
 //! The full file is loaded by `crate::config`; this module exposes the
 //! [`ShipperSection`] type that mirrors the JSON, and
 //! [`resolve_shipper`] which turns it into a validated, ready-to-use
-//! [`ShipperConfig`] (DPAPI ciphertext decrypted, URL validated, …).
+//! [`ShipperConfig`] (DPAPI ciphertext decrypted, base URL validated, …).
+//!
+//! The target is **Wazabi Server** (`WazabiEDR_Server/`) — the FastAPI
+//! backend exposes `POST /api/v1/agents/{agent_id}/logs` for NDJSON
+//! telemetry ingestion (indexed into OpenSearch `wazabi-events`). The
+//! shipper builds that URL from `server_url` + `agent_id`; pointing the
+//! agent at a generic backend (Loki, Splunk HEC, …) is no longer
+//! supported in v1 — see `WazabiEDR_Doc/reference/server-api.md`.
 //!
 //! ```json
 //! {
 //!   "shipper": {
 //!     "enabled": true,
-//!     "url": "https://logs.example.com/wazabi/ingest",
+//!     "server_url": "https://wazabi.example.com",
+//!     "agent_id": "5f1b3a8e-1c4f-4d2e-9b8a-7e3f6a9c0d11",
 //!     "tenant_id": "acme",
 //!     "tags": { "env": "prod", "region": "eu-w1" },
 //!     "token_encrypted_b64": "AQAAANC...",
@@ -21,14 +29,20 @@
 //! }
 //! ```
 //!
+//! - `server_url` is the base URL of Wazabi Server. The shipper appends
+//!   `/api/v1/agents/{agent_id}/logs` itself.
+//! - `agent_id` is the UUID assigned by the server at enrolment. Until
+//!   the agent learns to enrol itself (out of scope for v1, see
+//!   `WazabiEDR_Doc/architecture/shipper.md`), it must be pre-provisioned
+//!   in the file.
 //! - `token_encrypted_b64` is DPAPI-LOCAL_MACHINE ciphertext, base64'd.
 //!   See `WazabiEDR_Doc/usage/configuring-shipper.md` for the
 //!   PowerShell snippet that generates it.
 //! - `token_plain` is a fallback for development setups — the agent
 //!   logs a warning when it's used and refuses if both are set at once.
-//! - Everything else has sensible defaults; only `url` (and a token in
-//!   one form or the other) is strictly required when the section is
-//!   enabled.
+//! - Everything else has sensible defaults; only `server_url`,
+//!   `agent_id` and one of the token forms are strictly required when
+//!   the section is enabled.
 
 use std::time::Duration;
 
@@ -39,7 +53,14 @@ use crate::shipper::secret::{b64_decode, dpapi_unprotect};
 /// Resolved, validated shipper config — what the running shipper sees.
 #[derive(Clone, Debug)]
 pub struct ShipperConfig {
-    pub url: String,
+    /// Base URL of Wazabi Server (scheme + host + optional port). No
+    /// trailing slash, no path. The shipper builds the full ingest URL
+    /// by appending `/api/v1/agents/{agent_id}/logs`.
+    pub server_url: String,
+    /// UUID assigned to this agent by the server at enrolment. The
+    /// agent does not currently call `/enroll` itself — operator
+    /// provisions it in `agent.json`.
+    pub agent_id: String,
     pub tenant_id: Option<String>,
     /// Free-form tags appended as HTTP headers (`X-Wazabi-Tag-<key>`).
     /// Kept simple on purpose — anything more structured belongs in
@@ -51,12 +72,16 @@ pub struct ShipperConfig {
     pub timeout: Duration,
     pub poll_interval: Duration,
     pub max_backoff: Duration,
-    /// Debug mode: decompress each batch in memory before POSTing so the
-    /// server receives plain NDJSON (no `Content-Encoding: zstd`). Lets
-    /// the operator point the agent at a trivial HTTP listener and read
-    /// the payload directly. NOT for production — defeats the spool's
-    /// compression benefit on bandwidth.
-    pub debug: bool,
+}
+
+impl ShipperConfig {
+    /// Build the full `/logs` endpoint URL once at startup so the hot
+    /// loop doesn't reformat it on every iteration. The server expects
+    /// `{server_url}/api/v1/agents/{agent_id}/logs` exactly — `agent_id`
+    /// is the path parameter, not a header.
+    pub fn logs_endpoint(&self) -> String {
+        format!("{}/api/v1/agents/{}/logs", self.server_url, self.agent_id)
+    }
 }
 
 /// Raw JSON shape — what `crate::config` deserialises from disk.
@@ -64,7 +89,8 @@ pub struct ShipperConfig {
 pub struct ShipperSection {
     #[serde(default = "default_enabled")]
     enabled: bool,
-    url: Option<String>,
+    server_url: Option<String>,
+    agent_id: Option<String>,
     #[serde(default)]
     tenant_id: Option<String>,
     #[serde(default)]
@@ -81,8 +107,6 @@ pub struct ShipperSection {
     poll_interval_secs: u64,
     #[serde(default = "default_max_backoff_secs")]
     max_backoff_secs: u64,
-    #[serde(default)]
-    debug: bool,
 }
 
 impl ShipperSection {
@@ -117,32 +141,49 @@ fn default_max_backoff_secs() -> u64 {
 pub fn resolve_shipper(section: ShipperSection) -> Result<ShipperConfig, String> {
     let token = resolve_token(&section)?;
 
-    let url = section
-        .url
-        .ok_or_else(|| "shipper.url is required".to_string())?;
-    if !url.starts_with("https://") && !url.starts_with("http://") {
+    let mut server_url = section
+        .server_url
+        .ok_or_else(|| "shipper.server_url is required".to_string())?;
+    if !server_url.starts_with("https://") && !server_url.starts_with("http://") {
         return Err(format!(
-            "shipper.url must start with http:// or https:// (got {url:?})"
+            "shipper.server_url must start with http:// or https:// (got {server_url:?})"
         ));
+    }
+    // Trailing slash would produce `…//api/v1/…`. Strip once at parse
+    // time so the hot loop doesn't have to care.
+    while server_url.ends_with('/') {
+        server_url.pop();
     }
     // HTTP-only is allowed for dev/testing but the operator deserves a
     // loud warning — exfil over plaintext is not an EDR posture.
-    if url.starts_with("http://") {
+    if server_url.starts_with("http://") {
         eprintln!(
-            "[shipper] WARNING: url is plaintext HTTP, all telemetry will \
+            "[shipper] WARNING: server_url is plaintext HTTP, all telemetry will \
              travel in clear — production MUST use https://"
         );
     }
 
-    if section.debug {
-        eprintln!(
-            "[shipper] debug mode: batches will be decompressed before POST \
-             — server receives plain NDJSON (Content-Encoding header dropped)"
-        );
+    let agent_id = section
+        .agent_id
+        .ok_or_else(|| "shipper.agent_id is required (UUID assigned by Wazabi Server)".to_string())?;
+    if agent_id.trim().is_empty() {
+        return Err("shipper.agent_id must not be empty".into());
+    }
+    // We don't strictly parse the UUID — letting the server return 404
+    // on a malformed id is fine and avoids pulling a uuid dependency.
+    // But we want the obvious typos caught: spaces, control chars.
+    if agent_id
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(format!(
+            "shipper.agent_id contains whitespace/control chars: {agent_id:?}"
+        ));
     }
 
     Ok(ShipperConfig {
-        url,
+        server_url,
+        agent_id,
         tenant_id: section.tenant_id,
         tags: section.tags,
         token,
@@ -150,7 +191,6 @@ pub fn resolve_shipper(section: ShipperSection) -> Result<ShipperConfig, String>
         timeout: Duration::from_secs(section.timeout_secs.max(1)),
         poll_interval: Duration::from_secs(section.poll_interval_secs.max(1)),
         max_backoff: Duration::from_secs(section.max_backoff_secs.max(1)),
-        debug: section.debug,
     })
 }
 
