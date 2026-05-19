@@ -19,7 +19,8 @@
 //!     "zstd_level": 3
 //!   },
 //!   "shipper": {
-//!     "url": "https://logs.example.com/wazabi/ingest",
+//!     "server_url": "https://wazabi.example.com",
+//!     "agent_id": "5f1b3a8e-1c4f-4d2e-9b8a-7e3f6a9c0d11",
 //!     "token_encrypted_b64": "AQAAANC..."
 //!   }
 //! }
@@ -215,9 +216,9 @@ fn write_default_config(path: &Path) -> Result<(), String> {
         },
         "shipper": {
             "enabled": false,
-            "url": "https://logs.example.com/wazabi/ingest",
-            "token_encrypted_b64": "",
-            "debug": false
+            "server_url": "https://wazabi.example.com",
+            "agent_id": "",
+            "token_encrypted_b64": ""
         }
     });
 

@@ -723,8 +723,9 @@ fn validate_handshake<'a>(
 /// the attribution fields (`plugin_id`, `session_id`, …) come from the
 /// session state and CANNOT be spoofed by anything the plugin stuffed
 /// into its payload. The shape matches the kernel envelope
-/// (`source`/`kind`/`payload` + `ts`) so a single SIEM rule can match
-/// across both sources.
+/// (`ts`/`module`/`event_type`/`source`/`kind`/`raw`) so a single
+/// OpenSearch index (Wazabi Server's `wazabi-events`) and a single SIEM
+/// rule can match across both sources.
 fn emit_event(
     manifest: &PluginManifest,
     identity: &ClientIdentity,
@@ -743,10 +744,22 @@ fn emit_event(
         .unwrap_or(0);
     let ts_iso = format_iso8601_ns(now_ns);
 
-    let mut obj = serde_json::Map::with_capacity(10);
+    let mut obj = serde_json::Map::with_capacity(12);
     obj.insert("ts".into(), serde_json::Value::String(ts_iso));
     obj.insert("ts_unix_ns".into(), serde_json::Value::from(now_ns));
     obj.insert("source".into(), serde_json::Value::String("plugin".into()));
+    // Server-required fields (Wazabi Server `EventIn` schema). Plugin
+    // `kind` is free-form, so we route every plugin event through the
+    // `plugin_event` catch-all and keep the original label in `kind`
+    // (and `raw.kind`, since the server applies `extra="allow"`).
+    obj.insert(
+        "module".into(),
+        serde_json::Value::String("plugin".into()),
+    );
+    obj.insert(
+        "event_type".into(),
+        serde_json::Value::String("plugin_event".into()),
+    );
     obj.insert("kind".into(), serde_json::Value::String(ev.kind.clone()));
     obj.insert(
         "plugin_id".into(),
@@ -766,7 +779,10 @@ fn emit_event(
         "plugin_ts_unix_ns".into(),
         serde_json::Value::from(ev.ts_unix_ns),
     );
-    obj.insert("payload".into(), ev.payload.clone());
+    // Stored under `raw` to match the server's `EventIn.raw` field
+    // (and the kernel envelope's `raw`). The plugin chose the shape;
+    // we don't enforce one.
+    obj.insert("raw".into(), ev.payload.clone());
 
     let mut line = match serde_json::to_vec(&serde_json::Value::Object(obj)) {
         Ok(b) => b,
