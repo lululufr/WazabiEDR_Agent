@@ -30,6 +30,7 @@
 //! ```
 
 mod config;
+mod detection;
 mod ipc;
 mod plugin;
 mod shipper;
@@ -38,6 +39,7 @@ mod spool;
 mod util;
 
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crate::config::{AppConfig, print_help_and_exit};
@@ -73,6 +75,32 @@ fn main() -> io::Result<()> {
     let handle = open_device()?;
 
     let console_output = cfg.agent.console_output;
+
+    // Waza detection layer. Opt-in via the `detection` config section.
+    // A load failure (bad rules file) disables detection but is NOT fatal
+    // — the agent keeps ingesting/shipping exactly as before. When loaded,
+    // a background thread hot-reloads the rules file on change.
+    let (detection, detection_reload) = match cfg.detection.as_ref() {
+        Some(d) => match detection::DetectionEngine::load(
+            &d.rules_path,
+            d.schema_path.as_deref(),
+            d.default_window,
+        ) {
+            Ok(engine) => {
+                let engine = Arc::new(engine);
+                let reload = detection::spawn_reload(Arc::clone(&engine), d.reload_interval);
+                (Some(engine), reload)
+            }
+            Err(e) => {
+                eprintln!("[waza] detection disabled — failed to load rules: {e}");
+                (None, None)
+            }
+        },
+        None => {
+            eprintln!("[waza] detection disabled (no [detection] config section)");
+            (None, None)
+        }
+    };
 
     // Kernel-event spool. Spawned first so the pump can start
     // submitting immediately.
@@ -121,7 +149,7 @@ fn main() -> io::Result<()> {
     let plugin_dir = plugin::manifest::default_dir();
     let plugin_submitter = plugin_spool.as_ref().map(|s| s.submitter());
     let plugin_server =
-        match plugin::spawn_server(plugin_dir.clone(), plugin_submitter, console_output) {
+        match plugin::spawn_server(plugin_dir.clone(), plugin_submitter, detection.clone(), console_output) {
             Ok(h) => Some(h),
             Err(e) => {
                 eprintln!(
@@ -167,9 +195,20 @@ fn main() -> io::Result<()> {
         console_output,
     );
 
-    run_pump_loop(handle, Some(&kernel_spool), console_output);
+    run_pump_loop(
+        handle,
+        Some(&kernel_spool),
+        detection.as_ref(),
+        console_output,
+    );
 
     close_device(handle);
+
+    // Stop the rules hot-reload thread early (it observes SHUTDOWN, set by
+    // the Ctrl+C handler that also unblocked the pump loop above).
+    if let Some(j) = detection_reload {
+        let _ = j.join();
+    }
 
     // Tear down in reverse spawn order. The supervisor first so plugin
     // child processes get a chance to flush their last events through

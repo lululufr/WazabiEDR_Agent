@@ -44,6 +44,9 @@ use windows_sys::Win32::System::Pipes::{
 };
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
+use crate::detection::DetectionEngine;
+use crate::detection::event::LogEvent;
+use crate::detection::flatten_fields;
 use crate::plugin::identity::{
     ClientIdentity, identify_client, sha256_file_hex, verify_authenticode,
 };
@@ -172,6 +175,7 @@ impl PluginServerHandle {
 pub fn spawn_server(
     manifest_dir: PathBuf,
     spool: Option<SpoolSubmitter>,
+    detection: Option<Arc<DetectionEngine>>,
     console_output: bool,
 ) -> io::Result<PluginServerHandle> {
     let stats = Arc::new(PluginStats::default());
@@ -205,6 +209,7 @@ pub fn spawn_server(
     let accept_stats = Arc::clone(&stats);
     let accept_active = Arc::clone(&active_sessions);
     let accept_spool = spool.clone();
+    let accept_detection = detection.clone();
     let accept_join = thread::Builder::new()
         .name("wedr-plugin-accept".into())
         .spawn(move || {
@@ -213,6 +218,7 @@ pub fn spawn_server(
                 accept_stats,
                 accept_active,
                 accept_spool,
+                accept_detection,
                 console_output,
             )
         })?;
@@ -260,6 +266,7 @@ fn accept_loop(
     stats: Arc<PluginStats>,
     active_sessions: Arc<AtomicUsize>,
     spool: Option<SpoolSubmitter>,
+    detection: Option<Arc<DetectionEngine>>,
     console_output: bool,
 ) {
     eprintln!("[plugin] server listening on {}", PIPE_NAME);
@@ -313,6 +320,7 @@ fn accept_loop(
                 let stats_thread = Arc::clone(&stats);
                 let counter = Arc::clone(&active_sessions);
                 let session_spool = spool.clone();
+                let session_detection = detection.clone();
                 let pid_label = stats.sessions_accepted.load(Ordering::Relaxed);
                 let name = format!("wedr-plugin-{:04}", pid_label);
                 let pipe_addr = handle_to_usize(pipe);
@@ -323,6 +331,7 @@ fn accept_loop(
                         &session_store,
                         &stats_thread,
                         session_spool.as_ref(),
+                        session_detection.as_ref(),
                         console_output,
                     );
                     unsafe {
@@ -563,6 +572,7 @@ fn handle_session(
     store: &ManifestStore,
     stats: &PluginStats,
     spool: Option<&SpoolSubmitter>,
+    detection: Option<&Arc<DetectionEngine>>,
     console_output: bool,
 ) -> Result<(), String> {
     let identity = identify_client(pipe).map_err(|e| format!("identity: {}", e))?;
@@ -631,6 +641,7 @@ fn handle_session(
                     &session_id,
                     &ev,
                     spool,
+                    detection,
                     console_output,
                 );
             }
@@ -732,6 +743,7 @@ fn emit_event(
     session_id: &str,
     ev: &Event,
     spool: Option<&SpoolSubmitter>,
+    detection: Option<&Arc<DetectionEngine>>,
     console_output: bool,
 ) {
     // Agent-side wall-clock ingest time. We do NOT trust `ev.ts_unix_ns`
@@ -800,6 +812,26 @@ fn emit_event(
     if let Some(s) = spool {
         let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
         let _ = s.try_submit(shared);
+    }
+
+    // Feed the Waza detection engine. A plugin event maps to
+    // module="plugin", event_type=<the plugin's own `kind`> (so rules can
+    // target a specific telemetry kind, e.g. `plugin.app_login.user`),
+    // with the author-defined payload flattened into the field map. This
+    // is independent of the NDJSON/server schema above — it affects only
+    // local detection.
+    if let Some(engine) = detection {
+        let fields = match &ev.payload {
+            serde_json::Value::Object(obj) => flatten_fields(obj),
+            _ => std::collections::HashMap::new(),
+        };
+        let log = LogEvent {
+            module: "plugin".to_string(),
+            event_type: ev.kind.clone(),
+            fields,
+            timestamp: std::time::Instant::now(),
+        };
+        engine.process(log);
     }
 }
 

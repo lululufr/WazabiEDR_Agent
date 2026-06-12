@@ -20,9 +20,12 @@
 
 use std::mem::size_of;
 use std::ptr;
+use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::detection::event::LogEvent;
+use crate::detection::flatten_fields;
 use crate::ipc::events::{
     EVENT_TYPE_IMAGE_LOAD, EVENT_TYPE_PROCESS_CREATE, EVENT_TYPE_PROCESS_EXIT,
     EVENT_TYPE_PROCESS_HANDLE_ACCESS, EVENT_TYPE_REGISTRY_MODIFY, EVENT_TYPE_THREAD_CREATE,
@@ -124,11 +127,25 @@ fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
     Some(ProcessSlim { pid, ppid, path })
 }
 
-/// Encode one raw kernel event into a single-line JSON document.
-///
-/// Returned bytes are exactly `{...}\n` — ready to append to an NDJSON
-/// stream without an extra allocation at the call site.
-pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
+/// Decoded form of a kernel event: the server-shaped `event_type` plus
+/// the `raw` payload and the header metadata. Produced once by
+/// [`decode_kernel_event`] and consumed both by the NDJSON encoder and
+/// the detection `LogEvent` builder so a single parse serves both.
+struct DecodedKernel {
+    kind: &'static str,
+    event_type: &'static str,
+    payload: serde_json::Value,
+    ts: String,
+    ts_ft_100ns: i64,
+    version: u16,
+    drop_count: u32,
+    trunc_count: u32,
+}
+
+/// Parse the header + per-type payload of a raw kernel event exactly
+/// once. Shared by [`encode_kernel_event`] and
+/// [`encode_kernel_event_and_log`].
+fn decode_kernel_event(buf: &[u8]) -> Result<DecodedKernel, String> {
     if buf.len() < size_of::<EventHeader>() {
         return Err(format!(
             "event too short: {} bytes, expected at least {}",
@@ -157,14 +174,6 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
 
-    // (kind, event_type, payload) — `kind` is the historical agent-side
-    // label kept in the envelope for debug; `event_type` is the
-    // server-side `EventType` enum value (snake_case) routed straight
-    // through to OpenSearch. The two stay in sync deliberately: changing
-    // either side without the other will cause server-side parse
-    // failures or break human pretty-printing. "Unknown" maps to
-    // `process_create` as a least-bad fallback rather than a fabricated
-    // type the server's enum would reject.
     let (kind, event_type, payload) = match h_type {
         EVENT_TYPE_PROCESS_CREATE => (
             "ProcessCreate",
@@ -176,11 +185,7 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
             "process_terminate",
             encode_process_exit(buf, h_size)?,
         ),
-        EVENT_TYPE_IMAGE_LOAD => (
-            "ImageLoad",
-            "module_load",
-            encode_image_load(buf, h_size)?,
-        ),
+        EVENT_TYPE_IMAGE_LOAD => ("ImageLoad", "module_load", encode_image_load(buf, h_size)?),
         EVENT_TYPE_REGISTRY_MODIFY => (
             "RegistryModify",
             "registry_write",
@@ -191,11 +196,7 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
             "thread_create",
             encode_thread_create(buf, h_size)?,
         ),
-        EVENT_TYPE_THREAD_EXIT => (
-            "ThreadExit",
-            "thread_exit",
-            encode_thread_exit(buf, h_size)?,
-        ),
+        EVENT_TYPE_THREAD_EXIT => ("ThreadExit", "thread_exit", encode_thread_exit(buf, h_size)?),
         EVENT_TYPE_PROCESS_HANDLE_ACCESS => (
             "ProcessHandleAccess",
             "process_handle_access",
@@ -208,25 +209,74 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
         ),
     };
 
-    let process = extract_process(&payload);
-
-    let env = KernelEnvelope {
-        ts: format_timestamp(h_timestamp),
-        module: "kernel_callback",
-        event_type,
-        process,
-        raw: &payload,
-        ts_ft_100ns: h_timestamp,
-        source: "kernel",
+    Ok(DecodedKernel {
         kind,
-        event_version: h_version,
+        event_type,
+        payload,
+        ts: format_timestamp(h_timestamp),
+        ts_ft_100ns: h_timestamp,
+        version: h_version,
         drop_count: h_drop,
         trunc_count: h_trunc,
-    };
+    })
+}
 
+/// Serialise a [`DecodedKernel`] into the NDJSON envelope (`{...}\n`).
+fn encode_decoded(d: &DecodedKernel) -> Result<Vec<u8>, String> {
+    let process = extract_process(&d.payload);
+    let env = KernelEnvelope {
+        ts: d.ts.clone(),
+        module: "kernel_callback",
+        event_type: d.event_type,
+        process,
+        raw: &d.payload,
+        ts_ft_100ns: d.ts_ft_100ns,
+        source: "kernel",
+        kind: d.kind,
+        event_version: d.version,
+        drop_count: d.drop_count,
+        trunc_count: d.trunc_count,
+    };
     let mut out = serde_json::to_vec(&env).map_err(|e| format!("serialize: {e}"))?;
     out.push(b'\n');
     Ok(out)
+}
+
+/// Build a detection [`LogEvent`] from a decoded kernel event. Fields are
+/// the flattened scalar entries of the `raw` payload (`pid`, `image_path`,
+/// `op`, `remote_injection`, …) — exactly the names a `.waza` rule
+/// references as `kernel_callback.<event_type>.<field>`.
+fn decoded_to_log_event(d: &DecodedKernel) -> LogEvent {
+    let fields = match d.payload.as_object() {
+        Some(obj) => flatten_fields(obj),
+        None => std::collections::HashMap::new(),
+    };
+    LogEvent {
+        module: "kernel_callback".to_string(),
+        event_type: d.event_type.to_string(),
+        fields,
+        timestamp: Instant::now(),
+    }
+}
+
+/// Encode one raw kernel event into a single-line JSON document.
+///
+/// Returned bytes are exactly `{...}\n` — ready to append to an NDJSON
+/// stream without an extra allocation at the call site.
+pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
+    let d = decode_kernel_event(buf)?;
+    encode_decoded(&d)
+}
+
+/// Like [`encode_kernel_event`] but also returns the detection
+/// [`LogEvent`] built from the same single parse. Used on the pump
+/// thread when the Waza detection layer is enabled, so the hot path
+/// parses the packed event only once for both the spool and the engine.
+pub fn encode_kernel_event_and_log(buf: &[u8]) -> Result<(Vec<u8>, LogEvent), String> {
+    let d = decode_kernel_event(buf)?;
+    let line = encode_decoded(&d)?;
+    let log = decoded_to_log_event(&d);
+    Ok((line, log))
 }
 
 unsafe fn read_packed<T: Copy>(buf: &[u8], header_size: u32, name: &str) -> Result<T, String> {

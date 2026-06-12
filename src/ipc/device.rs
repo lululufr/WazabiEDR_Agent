@@ -14,7 +14,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
-use crate::ipc::json::encode_kernel_event;
+use crate::detection::DetectionEngine;
+use crate::ipc::json::{encode_kernel_event, encode_kernel_event_and_log};
 use crate::ipc::parser::parse_and_print;
 use crate::shutdown::SHUTDOWN;
 use crate::spool::SpoolHandle;
@@ -71,7 +72,17 @@ pub fn open_device() -> io::Result<HANDLE> {
 /// `console_output` controls whether the human-readable line goes to
 /// stdout. Diagnostic stderr messages and the spool path are not
 /// affected — turning console off is purely a stdout suppressor.
-pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>, console_output: bool) {
+///
+/// `detection` is the optional Waza engine. When `Some`, each event is
+/// decoded once into both the NDJSON spool line and a `LogEvent` fed to
+/// the engine. When `None`, the loop behaves exactly as before this
+/// feature existed (single encode, spool only) — zero added cost.
+pub fn run_pump_loop(
+    handle: HANDLE,
+    spool: Option<&SpoolHandle>,
+    detection: Option<&Arc<DetectionEngine>>,
+    console_output: bool,
+) {
     let mut buf = vec![0u8; INITIAL_BUF];
     // One-shot guard so we only complain about a dead writer thread the
     // first time we notice — repeating the warning every iteration would
@@ -126,20 +137,39 @@ pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>, console_output
         // encoding fails (unknown event version, truncated buffer), we
         // log and drop — the raw bytes wouldn't be re-parseable by any
         // downstream consumer anyway.
-        if let Some(spool) = spool {
-            if !spool.is_alive() && !writer_warning_emitted.swap(true, Ordering::AcqRel) {
-                eprintln!(
-                    "[agent] spool writer thread is no longer running — \
-                     events will accumulate in the kernel ring and \
-                     eventually be dropped"
-                );
-            }
-            match encode_kernel_event(payload) {
-                Ok(line) => {
-                    let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
-                    let _ = spool.try_submit(shared);
+        if spool.is_some() || detection.is_some() {
+            if let Some(spool) = spool {
+                if !spool.is_alive() && !writer_warning_emitted.swap(true, Ordering::AcqRel) {
+                    eprintln!(
+                        "[agent] spool writer thread is no longer running — \
+                         events will accumulate in the kernel ring and \
+                         eventually be dropped"
+                    );
                 }
-                Err(e) => eprintln!("[agent] spool encode error: {}", e),
+            }
+
+            // When detection is on we need the structured LogEvent too, so
+            // decode once into (line, log). Otherwise keep the cheaper
+            // line-only path. Either way the spool sees the same NDJSON.
+            if let Some(engine) = detection {
+                match encode_kernel_event_and_log(payload) {
+                    Ok((line, log)) => {
+                        if let Some(spool) = spool {
+                            let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
+                            let _ = spool.try_submit(shared);
+                        }
+                        engine.process(log);
+                    }
+                    Err(e) => eprintln!("[agent] spool encode error: {}", e),
+                }
+            } else if let Some(spool) = spool {
+                match encode_kernel_event(payload) {
+                    Ok(line) => {
+                        let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
+                        let _ = spool.try_submit(shared);
+                    }
+                    Err(e) => eprintln!("[agent] spool encode error: {}", e),
+                }
             }
         }
 

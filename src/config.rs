@@ -50,6 +50,35 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     /// `None` means spool-only mode (no upload).
     pub shipper: Option<ShipperConfig>,
+    /// `None` (or `enabled: false`) means the Waza detection layer is
+    /// off — the agent behaves exactly as before this feature existed.
+    pub detection: Option<DetectionConfig>,
+}
+
+/// Waza detection-layer tunables. Opt-in: absent section ⇒ no detection.
+#[derive(Clone, Debug)]
+pub struct DetectionConfig {
+    /// Path to the root `.waza` rules file. `include` directives inside
+    /// it are resolved relative to this file.
+    pub rules_path: PathBuf,
+    /// Optional JSON schema file used only to validate rule field paths
+    /// at load time (warns on likely typos). `None` ⇒ validation skipped.
+    pub schema_path: Option<PathBuf>,
+    /// Correlation window for rule groups that don't declare `window:`.
+    pub default_window: Duration,
+    /// How often the rules file is polled for changes (hot reload).
+    pub reload_interval: Duration,
+}
+
+impl Default for DetectionConfig {
+    fn default() -> Self {
+        Self {
+            rules_path: default_rules_path(),
+            schema_path: None,
+            default_window: Duration::from_secs(5),
+            reload_interval: Duration::from_secs(5),
+        }
+    }
 }
 
 /// Agent-side tunables: spool sizing + console output toggle.
@@ -95,6 +124,22 @@ struct ConfigFile {
     agent: Option<AgentSection>,
     #[serde(default)]
     shipper: Option<ShipperSection>,
+    #[serde(default)]
+    detection: Option<DetectionSection>,
+}
+
+#[derive(Deserialize, Default)]
+struct DetectionSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    rules_path: Option<String>,
+    #[serde(default)]
+    schema_path: Option<String>,
+    #[serde(default)]
+    default_window_secs: Option<u64>,
+    #[serde(default)]
+    reload_interval_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -129,6 +174,13 @@ fn default_spool_dir() -> PathBuf {
     base.join("WazabiEDR").join("spool")
 }
 
+fn default_rules_path() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    base.join("WazabiEDR").join("rules").join("main.waza")
+}
+
 impl AppConfig {
     /// Load and resolve the full configuration.
     ///
@@ -156,6 +208,7 @@ impl AppConfig {
                 return Ok(Self {
                     agent: AgentConfig::default(),
                     shipper: None,
+                    detection: None,
                 });
             }
             Err(e) => return Err(format!("read {:?}: {}", path, e)),
@@ -169,8 +222,37 @@ impl AppConfig {
             Some(s) if s.is_enabled() => Some(resolve_shipper(s)?),
             _ => None,
         };
+        let detection = match parsed.detection {
+            Some(d) if d.enabled.unwrap_or(false) => Some(resolve_detection(d)),
+            _ => None,
+        };
 
-        Ok(Self { agent, shipper })
+        Ok(Self {
+            agent,
+            shipper,
+            detection,
+        })
+    }
+}
+
+fn resolve_detection(s: DetectionSection) -> DetectionConfig {
+    let d = DetectionConfig::default();
+    // Treat an empty string the same as "absent" so the skeleton's
+    // placeholder `"schema_path": ""` doesn't resolve to a bogus path.
+    let non_empty = |o: Option<String>| o.filter(|s| !s.trim().is_empty());
+    DetectionConfig {
+        rules_path: non_empty(s.rules_path)
+            .map(PathBuf::from)
+            .unwrap_or(d.rules_path),
+        schema_path: non_empty(s.schema_path).map(PathBuf::from),
+        default_window: s
+            .default_window_secs
+            .map(Duration::from_secs)
+            .unwrap_or(d.default_window),
+        reload_interval: s
+            .reload_interval_secs
+            .map(Duration::from_secs)
+            .unwrap_or(d.reload_interval),
     }
 }
 
@@ -219,6 +301,13 @@ fn write_default_config(path: &Path) -> Result<(), String> {
             "server_url": "https://wazabi.example.com",
             "agent_id": "",
             "token_encrypted_b64": ""
+        },
+        "detection": {
+            "enabled": false,
+            "rules_path": default_rules_path().to_string_lossy(),
+            "schema_path": "",
+            "default_window_secs": 5,
+            "reload_interval_secs": 5
         }
     });
 
