@@ -15,8 +15,11 @@ The driver must be installed first (see
 
 ## Documentation
 
-All documentation lives in **[../WazabiEDR_Doc/](../WazabiEDR_Doc/README.md)**.
-Highlights for the agent:
+Start with **[ARCHITECTURE.md](ARCHITECTURE.md)** — a self-contained overview (FR)
+of what the agent does and how it talks to the driver, plugins and the Wazabi server.
+
+The rest of the documentation lives in
+**[../WazabiEDR_Doc/](../WazabiEDR_Doc/README.md)**. Highlights for the agent:
 
 - [Driver pump loop](../WazabiEDR_Doc/architecture/agent-pump.md)
 - [On-disk spool](../WazabiEDR_Doc/architecture/agent-spool.md)
