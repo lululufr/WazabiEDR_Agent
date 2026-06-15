@@ -1,28 +1,36 @@
 # WazabiEDR_Agent
 
-User-mode agent for [WazabiEDR](../WazabiEDR_Doc/README.md): pumps
-the kernel driver, spools events to disk, hosts the plugin named pipe.
+Agent user-mode de l'EDR **WazabiEDR** : pompe le driver kernel, normalise et spoole les events
+sur disque (NDJSON + zstd), héberge le serveur de plugins (named pipe), et expédie les lots au
+serveur en HTTPS (shipper). Sources de télémétrie : le [driver](../WazabiEDR_Driver/) et des
+[plugins](../WazabiEDR_PluginSDK/) ; destination : le [serveur](../WazabiEDR_Server/).
 
 ## Build & run
 
 ```powershell
 cargo build --release
-.\target\release\WazabiEDR_Agent.exe --help
+.\target\release\WazabiEDR_Agent.exe
 ```
 
-The driver must be installed first (see
-[`WazabiEDR_Doc/usage/installing-driver.md`](../WazabiEDR_Doc/usage/installing-driver.md)).
+Le driver doit être installé d'abord (voir
+[`WazabiEDR_Driver/doc/usage/installing-driver.md`](../WazabiEDR_Driver/doc/usage/installing-driver.md)).
 
 ## Documentation
 
-All documentation lives in **[../WazabiEDR_Doc/](../WazabiEDR_Doc/README.md)**.
-Highlights for the agent:
+Toute la documentation vit désormais **dans les dépôts** (plus de dépôt `WazabiEDR_Doc`).
 
-- [Driver pump loop](../WazabiEDR_Doc/architecture/agent-pump.md)
-- [On-disk spool](../WazabiEDR_Doc/architecture/agent-spool.md)
-- [Plugin server](../WazabiEDR_Doc/architecture/plugin-server.md)
-- [Plugin manifest store](../WazabiEDR_Doc/architecture/plugin-manifest.md)
-- [Plugin identity verification](../WazabiEDR_Doc/architecture/plugin-identity.md)
-- [Plugin wire protocol](../WazabiEDR_Doc/architecture/plugin-protocol.md)
-- [Running the agent (operator)](../WazabiEDR_Doc/usage/running-agent.md)
-- [Config reference (every flag/env)](../WazabiEDR_Doc/reference/config-reference.md)
+- 📐 **[ARCHITECTURE.md](ARCHITECTURE.md)** — le document à lire en premier : cycle de vie & threads,
+  driver, spool, shipper, serveur de plugins, moteur de détection Waza, configuration.
+  > Note : l'`ARCHITECTURE.md` vit aujourd'hui sur la branche `feat/waza-detection` (le moteur de
+  > détection n'existe que là). Les guides ci-dessous sont sur la branche `docs/architecture` —
+  > à fusionner sur la même branche selon votre flux Git.
+- 🏃 [doc/usage/running-agent.md](doc/usage/running-agent.md) — lancer l'agent, lire la sortie.
+- 🚚 [doc/usage/configuring-shipper.md](doc/usage/configuring-shipper.md) — pointer vers le serveur, token DPAPI.
+- 📑 [doc/reference/config-reference.md](doc/reference/config-reference.md) — tout `agent.json`, threads, arrêt.
+
+Voir aussi : la référence des événements kernel
+([`WazabiEDR_Driver/doc/reference/event-types.md`](../WazabiEDR_Driver/doc/reference/event-types.md)),
+le protocole de fil des plugins
+([`WazabiEDR_PluginSDK/doc/reference/plugin-protocol.md`](../WazabiEDR_PluginSDK/doc/reference/plugin-protocol.md)),
+et le dépannage transverse
+([`WazabiEDR_Server/doc/usage/troubleshooting.md`](../WazabiEDR_Server/doc/usage/troubleshooting.md)).
