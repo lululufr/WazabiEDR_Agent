@@ -27,6 +27,7 @@
 //! - [`run`]    — the actual thread that does the POSTing
 
 pub mod config;
+pub mod enroll;
 pub mod run;
 pub mod secret;
 

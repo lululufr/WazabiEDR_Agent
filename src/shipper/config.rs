@@ -31,10 +31,11 @@
 //!
 //! - `server_url` is the base URL of Wazabi Server. The shipper appends
 //!   `/api/v1/agents/{agent_id}/logs` itself.
-//! - `agent_id` is the UUID assigned by the server at enrolment. Until
-//!   the agent learns to enrol itself (out of scope for v1, see
-//!   `WazabiEDR_Doc/architecture/shipper.md`), it must be pre-provisioned
-//!   in the file.
+//! - `agent_id` is a free-form identifier that ends up in the indexed
+//!   document. If omitted, it defaults to `%COMPUTERNAME%` so a fresh
+//!   install only needs `server_url` + token. The server no longer
+//!   assigns one (no `/enroll`); the operator picks whatever makes
+//!   sense — hostname, UUID, asset tag.
 //! - `token_encrypted_b64` is DPAPI-LOCAL_MACHINE ciphertext, base64'd.
 //!   See `WazabiEDR_Doc/usage/configuring-shipper.md` for the
 //!   PowerShell snippet that generates it.
@@ -57,9 +58,9 @@ pub struct ShipperConfig {
     /// trailing slash, no path. The shipper builds the full ingest URL
     /// by appending `/api/v1/agents/{agent_id}/logs`.
     pub server_url: String,
-    /// UUID assigned to this agent by the server at enrolment. The
-    /// agent does not currently call `/enroll` itself — operator
-    /// provisions it in `agent.json`.
+    /// Free-form identifier indexed alongside every event. Defaults to
+    /// `%COMPUTERNAME%` when `shipper.agent_id` is absent — keeps the
+    /// "just drop a token in agent.json" path open.
     pub agent_id: String,
     pub tenant_id: Option<String>,
     /// Free-form tags appended as HTTP headers (`X-Wazabi-Tag-<key>`).
@@ -89,7 +90,7 @@ impl ShipperConfig {
 pub struct ShipperSection {
     #[serde(default = "default_enabled")]
     enabled: bool,
-    server_url: Option<String>,
+    pub server_url: Option<String>,
     agent_id: Option<String>,
     #[serde(default)]
     tenant_id: Option<String>,
@@ -99,10 +100,17 @@ pub struct ShipperSection {
     token_encrypted_b64: Option<String>,
     #[serde(default)]
     token_plain: Option<String>,
+    /// Token partagé d'enrollment (`ENROLLMENT_TOKEN` côté serveur). Si
+    /// présent et qu'aucun token agent n'est encore persisté,
+    /// `crate::config` déclenche `POST /api/v1/agents/enroll` au boot,
+    /// puis réécrit le fichier avec `agent_id` + `token_plain` et
+    /// supprime cette ligne. Un seul shot par installation.
+    #[serde(default)]
+    pub enrollment_token: Option<String>,
     #[serde(default = "default_verify_tls")]
     verify_tls: bool,
     #[serde(default = "default_timeout_secs")]
-    timeout_secs: u64,
+    pub timeout_secs: u64,
     #[serde(default = "default_poll_interval_secs")]
     poll_interval_secs: u64,
     #[serde(default = "default_max_backoff_secs")]
@@ -114,6 +122,45 @@ impl ShipperSection {
     /// way to keep the credentials in the file but disable shipping.
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// `true` si on doit déclencher l'auto-enroll : un token partagé
+    /// est fourni, mais aucun couple `(agent_id, agent_token)` n'est
+    /// encore persisté localement.
+    pub fn needs_autoenroll(&self) -> bool {
+        let has_enrollment_token = self
+            .enrollment_token
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_agent_id = self
+            .agent_id
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_token = self
+            .token_plain
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+            || self
+                .token_encrypted_b64
+                .as_deref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+        has_enrollment_token && !has_agent_id && !has_token
+    }
+
+    /// Remplit la section avec le couple `(agent_id, agent_token)`
+    /// obtenu d'un `POST /enroll`, et oublie l'`enrollment_token` —
+    /// il n'a plus sa place dans le fichier persisté (un seul shot).
+    /// Le token est stocké en clair : la version DPAPI demanderait
+    /// un round-trip côté caller pour cipher, on garde simple en MVP.
+    pub fn fill_from_enroll(&mut self, agent_id: String, agent_token: String) {
+        self.agent_id = Some(agent_id);
+        self.token_plain = Some(agent_token);
+        self.token_encrypted_b64 = None;
+        self.enrollment_token = None;
     }
 }
 
@@ -163,12 +210,20 @@ pub fn resolve_shipper(section: ShipperSection) -> Result<ShipperConfig, String>
         );
     }
 
+    // agent_id is optional: a missing or empty value falls back to
+    // %COMPUTERNAME% so the minimum viable agent.json is "server_url +
+    // token". We only fail if that fallback is also missing (rare —
+    // every interactive Windows session sets COMPUTERNAME).
     let agent_id = section
         .agent_id
-        .ok_or_else(|| "shipper.agent_id is required (UUID assigned by Wazabi Server)".to_string())?;
-    if agent_id.trim().is_empty() {
-        return Err("shipper.agent_id must not be empty".into());
-    }
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            "shipper.agent_id missing and %COMPUTERNAME% is unset — \
+             set one of them explicitly"
+                .to_string()
+        })?;
     // We don't strictly parse the UUID — letting the server return 404
     // on a malformed id is fine and avoids pulling a uuid dependency.
     // But we want the obvious typos caught: spaces, control chars.

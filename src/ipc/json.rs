@@ -126,9 +126,12 @@ fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
 
 /// Encode one raw kernel event into a single-line JSON document.
 ///
-/// Returned bytes are exactly `{...}\n` — ready to append to an NDJSON
-/// stream without an extra allocation at the call site.
-pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
+/// Returns `Ok(Some(bytes))` for events the agent's allow-list keeps,
+/// `Ok(None)` when the event was filtered out (skip without alloc),
+/// `Err(msg)` only on malformed input. Returned bytes are exactly
+/// `{...}\n` — ready to append to an NDJSON stream without an extra
+/// allocation at the call site.
+pub fn encode_kernel_event(buf: &[u8]) -> Result<Option<Vec<u8>>, String> {
     if buf.len() < size_of::<EventHeader>() {
         return Err(format!(
             "event too short: {} bytes, expected at least {}",
@@ -208,6 +211,15 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
         ),
     };
 
+    // Filtre allow-list appliqué AVANT la sérialisation du document
+    // complet (économie CPU + alloc) mais APRÈS le décodage du payload —
+    // on a besoin du `event_type` résolu, et la version actuelle des
+    // events est si petite (~quelques structs packés) que le payload
+    // décodé est gratuit en pratique.
+    if !crate::filter::allows("kernel_callback", event_type) {
+        return Ok(None);
+    }
+
     let process = extract_process(&payload);
 
     let env = KernelEnvelope {
@@ -226,7 +238,7 @@ pub fn encode_kernel_event(buf: &[u8]) -> Result<Vec<u8>, String> {
 
     let mut out = serde_json::to_vec(&env).map_err(|e| format!("serialize: {e}"))?;
     out.push(b'\n');
-    Ok(out)
+    Ok(Some(out))
 }
 
 unsafe fn read_packed<T: Copy>(buf: &[u8], header_size: u32, name: &str) -> Result<T, String> {

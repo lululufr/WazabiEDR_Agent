@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::filter::FilterSection;
 use crate::shipper::config::{ShipperConfig, ShipperSection, resolve_shipper};
 
 /// Default location of the config file: `%ProgramData%\WazabiEDR\agent.json`.
@@ -50,6 +51,9 @@ pub struct AppConfig {
     pub agent: AgentConfig,
     /// `None` means spool-only mode (no upload).
     pub shipper: Option<ShipperConfig>,
+    /// Section `filter` brute. Consommée une fois par `filter::init` au
+    /// boot — pas de hot reload donc on n'a pas à la conserver après.
+    pub filter: Option<FilterSection>,
 }
 
 /// Agent-side tunables: spool sizing + console output toggle.
@@ -95,6 +99,8 @@ struct ConfigFile {
     agent: Option<AgentSection>,
     #[serde(default)]
     shipper: Option<ShipperSection>,
+    #[serde(default)]
+    filter: Option<FilterSection>,
 }
 
 #[derive(Deserialize, Default)]
@@ -156,6 +162,7 @@ impl AppConfig {
                 return Ok(Self {
                     agent: AgentConfig::default(),
                     shipper: None,
+                    filter: None,
                 });
             }
             Err(e) => return Err(format!("read {:?}: {}", path, e)),
@@ -166,12 +173,97 @@ impl AppConfig {
 
         let agent = resolve_agent(parsed.agent.unwrap_or_default());
         let shipper = match parsed.shipper {
-            Some(s) if s.is_enabled() => Some(resolve_shipper(s)?),
+            Some(mut s) if s.is_enabled() => {
+                if s.needs_autoenroll() {
+                    autoenroll_and_persist(&mut s, path)?;
+                }
+                Some(resolve_shipper(s)?)
+            }
             _ => None,
         };
 
-        Ok(Self { agent, shipper })
+        Ok(Self {
+            agent,
+            shipper,
+            filter: parsed.filter,
+        })
     }
+}
+
+/// Déclenche `POST /enroll`, écrit le résultat dans le fichier puis
+/// mute la section en mémoire pour que `resolve_shipper` voie le bon
+/// couple `(agent_id, token_plain)`.
+///
+/// Si l'enroll échoue (serveur down, token invalide, schéma serveur
+/// changé), on remonte une erreur — le caller affichera et l'agent
+/// refusera de démarrer. Cohérent avec le reste du resolve : un
+/// shipper en cours d'init mal configuré doit être loud.
+fn autoenroll_and_persist(s: &mut ShipperSection, path: &Path) -> Result<(), String> {
+    let server_url = s
+        .server_url
+        .clone()
+        .ok_or_else(|| "shipper.server_url is required for auto-enroll".to_string())?;
+    let enrollment_token = s
+        .enrollment_token
+        .clone()
+        .ok_or_else(|| "shipper.enrollment_token is required for auto-enroll".to_string())?;
+
+    eprintln!("[agent] no agent_id / token persisted yet — running auto-enroll against {server_url}");
+    let timeout = Duration::from_secs(s.timeout_secs.max(1));
+    let result = crate::shipper::enroll::perform(&server_url, &enrollment_token, timeout)
+        .map_err(|e| format!("auto-enroll failed: {e}"))?;
+    eprintln!(
+        "[agent] enroll succeeded — agent_id={} (persisting to {:?})",
+        result.agent_id, path
+    );
+
+    persist_enrollment(path, &result.agent_id, &result.agent_token)?;
+    s.fill_from_enroll(result.agent_id, result.agent_token);
+    Ok(())
+}
+
+/// Re-écrit `agent.json` après un enroll réussi : patche
+/// `shipper.agent_id` et `shipper.token_plain`, supprime
+/// `shipper.enrollment_token`. On manipule le JSON brut pour
+/// préserver les autres clés (commentaires, champs non liés au
+/// shipper, ordre raisonnable). Si la lecture/parse re-échoue ici,
+/// c'est qu'il y a une race avec un éditeur externe — on remonte
+/// l'erreur plutôt que d'écraser silencieusement.
+fn persist_enrollment(
+    path: &Path,
+    agent_id: &str,
+    agent_token: &str,
+) -> Result<(), String> {
+    use serde_json::Value;
+
+    let bytes = std::fs::read(path).map_err(|e| format!("re-read {:?}: {}", path, e))?;
+    let mut root: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("re-parse {:?}: {}", path, e))?;
+
+    let shipper = root
+        .get_mut("shipper")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| "shipper section disappeared during enroll".to_string())?;
+    shipper.insert("agent_id".into(), Value::String(agent_id.to_string()));
+    shipper.insert("token_plain".into(), Value::String(agent_token.to_string()));
+    shipper.remove("enrollment_token");
+    // Si un `token_encrypted_b64` traîne vide depuis le skeleton par
+    // défaut, on le supprime aussi — sinon le prochain load rejette
+    // ("mutually exclusive" plein vs DPAPI).
+    if shipper
+        .get("token_encrypted_b64")
+        .and_then(Value::as_str)
+        .map(str::is_empty)
+        .unwrap_or(false)
+    {
+        shipper.remove("token_encrypted_b64");
+    }
+
+    let mut content = serde_json::to_string_pretty(&root)
+        .map_err(|e| format!("re-serialize config: {}", e))?;
+    content.push('\n');
+    std::fs::write(path, content).map_err(|e| format!("write {:?}: {}", path, e))?;
+    Ok(())
 }
 
 fn resolve_agent(s: AgentSection) -> AgentConfig {
@@ -204,7 +296,13 @@ fn write_default_config(path: &Path) -> Result<(), String> {
     let d = AgentConfig::default();
     let skeleton = serde_json::json!({
         "_comment": "WazabiEDR agent — auto-generated default config. \
-                     See WazabiEDR_Doc/usage/configuring-shipper.md for the full schema.",
+                     For auto-enrollment: set shipper.enabled=true, \
+                     shipper.server_url, shipper.enrollment_token (matching \
+                     ENROLLMENT_TOKEN on the server) and restart. The agent \
+                     will call POST /api/v1/agents/enroll, then rewrite this \
+                     file with agent_id + token_plain (and remove \
+                     enrollment_token). See \
+                     WazabiEDR_Doc/usage/configuring-shipper.md for details.",
         "agent": {
             "console_output": d.console_output,
             "spool_dir": d.spool_dir.to_string_lossy(),
@@ -217,8 +315,9 @@ fn write_default_config(path: &Path) -> Result<(), String> {
         "shipper": {
             "enabled": false,
             "server_url": "https://wazabi.example.com",
+            "enrollment_token": "",
             "agent_id": "",
-            "token_encrypted_b64": ""
+            "token_plain": ""
         }
     });
 

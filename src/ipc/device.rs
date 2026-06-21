@@ -135,9 +135,12 @@ pub fn run_pump_loop(handle: HANDLE, spool: Option<&SpoolHandle>, console_output
                 );
             }
             match encode_kernel_event(payload) {
-                Ok(line) => {
+                Ok(Some(line)) => {
                     let shared: Arc<[u8]> = Arc::from(line.into_boxed_slice());
                     let _ = spool.try_submit(shared);
+                }
+                Ok(None) => {
+                    // Filtré par l'allow-list — pas d'erreur, juste une non-emission.
                 }
                 Err(e) => eprintln!("[agent] spool encode error: {}", e),
             }

@@ -734,6 +734,14 @@ fn emit_event(
     spool: Option<&SpoolSubmitter>,
     console_output: bool,
 ) {
+    // Tous les events plugin partagent module="plugin" et event_type=
+    // "plugin_event" — l'allow-list contrôle donc le canal entier (on
+    // ou off). Une granularité par `kind` viendra avec les règles Waza
+    // côté agent.
+    if !crate::filter::allows("plugin", "plugin_event") {
+        return;
+    }
+
     // Agent-side wall-clock ingest time. We do NOT trust `ev.ts_unix_ns`
     // for ordering — the plugin chose it; if its clock is skewed the
     // shipper's downstream pipeline would mis-order. We still ship it

@@ -215,6 +215,12 @@ fn send_one(agent: &ureq::Agent, cfg: &ShipperConfig, endpoint: &str, path: &Pat
         Ok(resp) => {
             let status = resp.status();
             if (200..300).contains(&status) {
+                // Le serveur peut répondre 202 mais avoir skipped des
+                // lignes silencieusement (validation Pydantic qui rate,
+                // schéma EventIn refusé, etc.). Lire le body permet de
+                // détecter ce drop autrement invisible. Best-effort : si
+                // le parse foire, on suppose 202 = tout OK.
+                log_logs_accepted(&path, resp);
                 Outcome::Ok
             } else if (400..500).contains(&status) {
                 Outcome::Rejected(status)
@@ -231,6 +237,40 @@ fn send_one(agent: &ureq::Agent, cfg: &ShipperConfig, endpoint: &str, path: &Pat
         }
         Err(ureq::Error::Transport(t)) => Outcome::Retry(format!("transport: {t}")),
     }
+}
+
+/// Parse `{ "batch_id": "...", "received": N, "skipped": N }` depuis le
+/// body d'une réponse 2xx. Log UNIQUEMENT quand `skipped > 0` — c'est
+/// un cas d'invalidité silencieuse côté serveur (lignes rejetées par
+/// la validation Pydantic) qui serait autrement invisible. Le cas
+/// nominal `skipped=0` reste silencieux pour ne pas polluer la sortie.
+fn log_logs_accepted(path: &Path, resp: ureq::Response) {
+    let body = match resp.into_string() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let skipped = parsed
+        .as_ref()
+        .and_then(|v| v.get("skipped"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if skipped == 0 {
+        return;
+    }
+    let received = parsed
+        .as_ref()
+        .and_then(|v| v.get("received"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("?");
+    eprintln!(
+        "[shipper] {name} accepted but server SKIPPED {skipped} line(s) \
+         (received={received}) — invalid NDJSON / EventIn schema mismatch"
+    );
 }
 
 /// Find the oldest unsent batch across every watched directory.

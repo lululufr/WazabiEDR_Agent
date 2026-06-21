@@ -30,6 +30,7 @@
 //! ```
 
 mod config;
+mod filter;
 mod ipc;
 mod plugin;
 mod shipper;
@@ -69,6 +70,10 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+
+    // Init du filtre AVANT toute consommation d'events : OnceLock global
+    // → toujours initialisé quand le pump thread démarre.
+    filter::init(cfg.filter.clone());
 
     let handle = open_device()?;
 
