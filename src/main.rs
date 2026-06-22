@@ -40,6 +40,9 @@ mod shutdown;
 mod spool;
 mod util;
 
+#[cfg(test)]
+mod test_support;
+
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

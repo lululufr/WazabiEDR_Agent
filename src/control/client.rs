@@ -333,4 +333,138 @@ mod tests {
         assert_eq!(v["action_taken"], "alert");
         assert_eq!(v["evidence"]["pid"], 4321);
     }
+
+    // -- Online tests --------------------------------------------------
+    // Exercise the REAL control-plane client against a running Wazabi
+    // Server. `#[ignore]`d (need a server); run with
+    // `cargo test -- --ignored` after `WAZABI_TEST_API_URL` is set.
+    use crate::test_support;
+
+    fn sample_heartbeat() -> HeartbeatRequest {
+        HeartbeatRequest {
+            status: "healthy",
+            agent_version: "test",
+            last_rule_version: 0,
+            profile_version: 0,
+            modules_loaded: vec![],
+            metrics: None,
+        }
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn heartbeat_ok() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped heartbeat_ok — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let (id, token) = test_support::enroll_agent(&ts);
+        let client = Client::new(test_support::creds(&ts, id, token));
+        let resp = client.heartbeat(&sample_heartbeat()).expect("heartbeat should succeed");
+        assert!(resp.next_checkin_seconds >= 0);
+        eprintln!(
+            "[test] heartbeat ok — profile_v={} cmds={}",
+            resp.current_profile_version,
+            resp.pending_commands.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn profile_metadata_ok() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped profile_metadata_ok — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let (id, token) = test_support::enroll_agent(&ts);
+        let client = Client::new(test_support::creds(&ts, id, token));
+        // 404 (no profile assigned) is a valid outcome → Ok(None).
+        let meta = client.get_profile_metadata().expect("profile metadata call should succeed");
+        if let Some(meta) = meta {
+            eprintln!("[test] profile v{} ({} modules)", meta.version, meta.modules_required.len());
+            client
+                .get_profile_template(&meta.profile_id)
+                .expect("template fetch should succeed when a profile is assigned");
+        } else {
+            eprintln!("[test] no profile assigned (Ok(None)) — acceptable");
+        }
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn post_alerts_ok() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped post_alerts_ok — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let (id, token) = test_support::enroll_agent(&ts);
+        let client = Client::new(test_support::creds(&ts, id, token));
+        let evidence = serde_json::json!({ "pid": 1234, "event_type": "thread_create" });
+        let alerts = [AlertOut {
+            ts: "2026-06-22T10:00:00.000Z",
+            rule_id: "integration_test_rule",
+            rule_name: "integration_test_rule",
+            severity: "medium",
+            module: "kernel_callback",
+            action_taken: "alert",
+            evidence: &evidence,
+        }];
+        let received = client.post_alerts(&alerts).expect("post_alerts should succeed");
+        assert!(received >= 1, "server should accept at least one alert");
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn ack_unknown_command_404() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped ack_unknown_command_404 — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let (id, token) = test_support::enroll_agent(&ts);
+        let client = Client::new(test_support::creds(&ts, id, token));
+        // A well-formed but unknown command UUID → 404. (Happy-path ack
+        // needs a console-created command, out of scope for this test.)
+        let err = client
+            .ack_command("00000000-0000-0000-0000-000000000000", "completed", serde_json::json!({}))
+            .expect_err("acking an unknown command must fail");
+        assert!(err.contains("404"), "expected HTTP 404, got: {err}");
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn heartbeat_bad_bearer_401() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped heartbeat_bad_bearer_401 — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let creds = test_support::creds(
+            &ts,
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            "not-a-valid-agent-token".to_string(),
+        );
+        let client = Client::new(creds);
+        let err = client.heartbeat(&sample_heartbeat()).expect_err("bad bearer must be rejected");
+        assert!(err.contains("401"), "expected HTTP 401, got: {err}");
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn heartbeat_agent_id_mismatch_403() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped heartbeat_agent_id_mismatch_403 — set WAZABI_TEST_API_URL");
+            return;
+        };
+        // Valid token, but a path agent_id that isn't this agent → 403.
+        let (_id, token) = test_support::enroll_agent(&ts);
+        let creds = test_support::creds(
+            &ts,
+            "11111111-1111-1111-1111-111111111111".to_string(),
+            token,
+        );
+        let client = Client::new(creds);
+        let err = client
+            .heartbeat(&sample_heartbeat())
+            .expect_err("agent_id ≠ token's agent must be rejected");
+        assert!(err.contains("403"), "expected HTTP 403, got: {err}");
+    }
 }
