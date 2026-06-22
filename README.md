@@ -21,9 +21,6 @@ Toute la documentation vit désormais **dans les dépôts** (plus de dépôt `Wa
 
 - 📐 **[ARCHITECTURE.md](ARCHITECTURE.md)** — le document à lire en premier : cycle de vie & threads,
   driver, spool, shipper, serveur de plugins, moteur de détection Waza, configuration.
-  > Note : l'`ARCHITECTURE.md` vit aujourd'hui sur la branche `feat/waza-detection` (le moteur de
-  > détection n'existe que là). Les guides ci-dessous sont sur la branche `docs/architecture` —
-  > à fusionner sur la même branche selon votre flux Git.
 - 🏃 [doc/usage/running-agent.md](doc/usage/running-agent.md) — lancer l'agent, lire la sortie.
 - 🚚 [doc/usage/configuring-shipper.md](doc/usage/configuring-shipper.md) — pointer vers le serveur, token DPAPI.
 - 📑 [doc/reference/config-reference.md](doc/reference/config-reference.md) — tout `agent.json`, threads, arrêt.

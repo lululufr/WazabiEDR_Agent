@@ -1,0 +1,64 @@
+# WazabiEDR — exemple de règles Waza.
+#
+# Convention de chemin : module.event_type.field
+#
+# Les noms ci-dessous sont ceux RÉELLEMENT émis par l'agent (voir
+# src/ipc/json.rs pour le kernel, src/plugin/server.rs pour les plugins) —
+# ce ne sont PAS les exemples illustratifs du CLAUDE.md.
+#
+# Module kernel : "kernel_callback"
+#   process_create        : pid, parent_pid, creating_pid, image_path
+#   process_terminate     : pid
+#   module_load           : pid, scope ("kernel"|"user"), image_base, image_size, image_path
+#   registry_write        : pid, op, op_code, key_path, value_name, value_type, data_size, data_preview_hex, data_truncated
+#   thread_create         : pid, tid, creating_pid, remote_injection (bool)
+#   thread_exit           : pid, tid
+#   process_handle_access : source_pid, target_pid, desired_access, original_desired_access, op ("Open"|"Duplicate")
+#
+# Module plugin : "plugin"
+#   event_type = le `kind` choisi par le plugin (ex: "app.login")
+#   champs     = le payload (aplati) du plugin
+#
+# Opérateurs : == != < > <= >=  contains  startsWith   |  &&  ||  !  ( )
+# Lignes multiples d'un même groupe Detection = OR implicite.
+
+- Detection:
+  - RemoteThreadInjection:
+      window: 5s
+      - kernel_callback.thread_create.remote_injection == true
+
+  - SuspiciousImagePath:
+      - kernel_callback.process_create.image_path contains "\\Temp\\"
+      - kernel_callback.process_create.image_path contains "\\AppData\\Local\\Temp"
+
+  - ProcessHandleTamper:
+      window: 10s
+      - kernel_callback.process_handle_access.op == "Open" && kernel_callback.process_create.image_path contains "lsass"
+
+  - ProcessHollowingInjection:
+      window: 10s
+      # Heuristique « process hollowing / injection » : dans la même
+      # fenêtre, un handle ouvert vers un autre process ET la creation d'un
+      # thread distant (motif OpenProcess + CreateRemoteThread).
+      # Limites du moteur actuel : ne lie PAS les pid des deux evenements
+      # entre eux, et ne peut pas tester les bits de desired_access (pas
+      # d'operateur bit-a-bit) -> heuristique grossiere, faux positifs
+      # possibles. Plus stricte que RemoteThreadInjection (qui ne regarde
+      # que le thread distant).
+      - kernel_callback.process_handle_access.op == "Open" && kernel_callback.thread_create.remote_injection == true
+
+- Action:
+  - RemoteThreadInjection:
+    - alert "Possible remote-thread injection (CreateRemoteThread pattern)"
+    - log
+
+  - SuspiciousImagePath:
+    - alert "Process launched from a temp directory"
+
+  - ProcessHandleTamper:
+    - alert "Suspicious handle access correlated with lsass activity"
+    - log
+
+  - ProcessHollowingInjection:
+    - alert "Possible process hollowing / remote injection"
+    - log
