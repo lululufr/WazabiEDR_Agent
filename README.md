@@ -24,6 +24,7 @@ Toute la documentation vit désormais **dans les dépôts** (plus de dépôt `Wa
 - 🏃 [doc/usage/running-agent.md](doc/usage/running-agent.md) — lancer l'agent, lire la sortie.
 - 🚚 [doc/usage/configuring-shipper.md](doc/usage/configuring-shipper.md) — pointer vers le serveur, token DPAPI.
 - 📑 [doc/reference/config-reference.md](doc/reference/config-reference.md) — tout `agent.json`, threads, arrêt.
+- 🧪 [doc/usage/testing-waza-hollowing.md](doc/usage/testing-waza-hollowing.md) — tester manuellement la détection Waza « process hollowing ».
 
 Voir aussi : la référence des événements kernel
 ([`WazabiEDR_Driver/doc/reference/event-types.md`](../WazabiEDR_Driver/doc/reference/event-types.md)),
