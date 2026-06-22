@@ -35,6 +35,18 @@
       window: 10s
       - kernel_callback.process_handle_access.op == "Open" && kernel_callback.process_create.image_path contains "lsass"
 
+  - ProcessHollowingInjection:
+      window: 10s
+      # Heuristique « process hollowing / injection » : dans la même
+      # fenêtre, un handle ouvert vers un autre process ET la creation d'un
+      # thread distant (motif OpenProcess + CreateRemoteThread).
+      # Limites du moteur actuel : ne lie PAS les pid des deux evenements
+      # entre eux, et ne peut pas tester les bits de desired_access (pas
+      # d'operateur bit-a-bit) -> heuristique grossiere, faux positifs
+      # possibles. Plus stricte que RemoteThreadInjection (qui ne regarde
+      # que le thread distant).
+      - kernel_callback.process_handle_access.op == "Open" && kernel_callback.thread_create.remote_injection == true
+
 - Action:
   - RemoteThreadInjection:
     - alert "Possible remote-thread injection (CreateRemoteThread pattern)"
@@ -45,4 +57,8 @@
 
   - ProcessHandleTamper:
     - alert "Suspicious handle access correlated with lsass activity"
+    - log
+
+  - ProcessHollowingInjection:
+    - alert "Possible process hollowing / remote injection"
     - log
