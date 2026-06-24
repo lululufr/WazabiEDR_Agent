@@ -348,3 +348,59 @@ fn next_backoff(curr: Duration, max: Duration) -> Duration {
     };
     Duration::from_millis(signed.max(1) as u64).min(max)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Online test for the real log-upload path (`send_one`): build a
+    //! genuine zstd batch and POST it to a running server. `#[ignore]`d;
+    //! run with `cargo test -- --ignored` and `WAZABI_TEST_API_URL` set.
+    use super::*;
+    use crate::shipper::config::ShipperConfig;
+    use crate::test_support;
+    use std::collections::BTreeMap;
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn send_one_uploads_ndjson() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped send_one_uploads_ndjson — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let (agent_id, token) = test_support::enroll_agent(&ts);
+        let cfg = ShipperConfig {
+            server_url: ts.url.clone(),
+            agent_id,
+            tenant_id: None,
+            tags: BTreeMap::new(),
+            token,
+            verify_tls: true,
+            timeout: Duration::from_secs(15),
+            poll_interval: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(30),
+        };
+
+        // A real sealed batch: NDJSON lines valid against the server's
+        // `EventIn` schema, zstd-compressed exactly like the spool writer.
+        let ndjson = concat!(
+            "{\"ts\":\"2026-06-22T10:00:00Z\",\"module\":\"kernel_callback\",\"event_type\":\"process_create\",\"raw\":{\"pid\":1000}}\n",
+            "{\"ts\":\"2026-06-22T10:00:01Z\",\"module\":\"kernel_callback\",\"event_type\":\"process_terminate\",\"raw\":{\"pid\":1000}}\n",
+        );
+        let compressed = zstd::stream::encode_all(ndjson.as_bytes(), 3).expect("zstd encode");
+        let path =
+            std::env::temp_dir().join(format!("wedr-test-batch-{}.zst", std::process::id()));
+        std::fs::write(&path, &compressed).expect("write temp batch");
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(15))
+            .build();
+        let endpoint = cfg.logs_endpoint();
+        let outcome = send_one(&agent, &cfg, &endpoint, &path);
+        let _ = std::fs::remove_file(&path);
+
+        match outcome {
+            Outcome::Ok => {}
+            Outcome::Rejected(s) => panic!("server rejected the batch: HTTP {s}"),
+            Outcome::Retry(e) => panic!("transient failure uploading batch: {e}"),
+        }
+    }
+}

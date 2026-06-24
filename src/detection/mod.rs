@@ -25,6 +25,7 @@ pub mod waza {
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -32,7 +33,45 @@ use std::time::Duration;
 use crate::shutdown::SHUTDOWN;
 use event::{FieldValue, LogEvent};
 use schema::{SchemaDeclaration, SchemaRegistry};
+use waza::ast::Action;
 use waza::engine::RuleEngine;
+
+/// A rule match worth reporting to the server, handed off to the
+/// control-plane thread over a bounded channel so the (hot) detection
+/// path never blocks on the network. The control plane maps this into
+/// the server's `AlertIn` JSON and POSTs it to `/agents/{id}/alerts`.
+///
+/// Built only for matches whose actions include `Alert`/`KillProcess` —
+/// a `Log`-only match is bookkeeping, not an alert.
+#[derive(Debug, Clone)]
+pub struct AgentAlert {
+    /// The matched rule's name. Doubles as `rule_id` server-side: local
+    /// `.waza` rules carry no UUID, and `AlertIn.rule_id` is a free-form
+    /// string, so the name is the most useful stable identifier we have.
+    pub rule_name: String,
+    /// `"kill"` if any action was `KillProcess`, else `"alert"`. Maps to
+    /// the server's `action_taken` enum.
+    pub action_taken: &'static str,
+    /// Originating module (e.g. `"kernel_callback"`, `"plugin"`) — a
+    /// valid value of the server's `AgentModule` enum.
+    pub module: String,
+    /// Wall-clock emission time, ISO-8601 UTC. Sampled here because a
+    /// [`LogEvent`] only carries a monotonic `Instant`.
+    pub ts: String,
+    /// The triggering event's scalar fields (plus `event_type`), as a JSON
+    /// object — sent as the alert's `evidence`.
+    pub evidence: serde_json::Value,
+}
+
+/// Convert a single [`FieldValue`] to its `serde_json` scalar.
+fn field_value_to_json(v: &FieldValue) -> serde_json::Value {
+    match v {
+        FieldValue::Int(i) => serde_json::Value::from(*i),
+        FieldValue::Float(f) => serde_json::Value::from(*f),
+        FieldValue::Str(s) => serde_json::Value::from(s.clone()),
+        FieldValue::Bool(b) => serde_json::Value::from(*b),
+    }
+}
 
 /// Convert one `serde_json` scalar to a [`FieldValue`]. Nested
 /// objects/arrays are dropped (`None`) — the rule language compares
@@ -74,6 +113,11 @@ pub struct DetectionEngine {
     schema: SchemaRegistry,
     rules_path: PathBuf,
     default_window: Duration,
+    /// Bounded channel to the control-plane alert sender. `None` when
+    /// alert forwarding is off (no control plane, or `send_alerts:false`).
+    /// `try_send` is used so a full channel drops the alert rather than
+    /// stalling the detection hot path.
+    alert_tx: Option<SyncSender<AgentAlert>>,
 }
 
 impl DetectionEngine {
@@ -108,7 +152,18 @@ impl DetectionEngine {
             schema,
             rules_path: rules_path.to_path_buf(),
             default_window,
+            alert_tx: None,
         })
+    }
+
+    /// Attach the control-plane alert sink. Builder-style so [`load`] keeps
+    /// a stable signature for tests; called once from `main` when the
+    /// control plane is up and `send_alerts` is on.
+    ///
+    /// [`load`]: Self::load
+    pub fn with_alert_sink(mut self, alert_tx: Option<SyncSender<AgentAlert>>) -> Self {
+        self.alert_tx = alert_tx;
+        self
     }
 
     /// HOT PATH: evaluate one event and run any triggered actions.
@@ -127,7 +182,54 @@ impl DetectionEngine {
             for action in &acts {
                 actions::execute(&rule_name, action, &event);
             }
+            // Forward alert-worthy matches to the control plane (if wired).
+            // A `Log`-only match is local bookkeeping, not an alert.
+            if let Some(tx) = &self.alert_tx {
+                self.emit_alert(tx, &rule_name, &acts, &event);
+            }
         }
+    }
+
+    /// Build an [`AgentAlert`] for a match and hand it to the control
+    /// plane. No-op if the match carried no `Alert`/`KillProcess` action.
+    /// Uses `try_send`: a saturated channel drops the alert (counted on
+    /// the control side) rather than blocking the detection thread.
+    fn emit_alert(
+        &self,
+        tx: &SyncSender<AgentAlert>,
+        rule_name: &str,
+        acts: &[Action],
+        event: &LogEvent,
+    ) {
+        let has_kill = acts.iter().any(|a| matches!(a, Action::KillProcess));
+        let has_alert = acts.iter().any(|a| matches!(a, Action::Alert(_)));
+        if !has_kill && !has_alert {
+            return;
+        }
+        let action_taken = if has_kill { "kill" } else { "alert" };
+
+        let mut evidence: serde_json::Map<String, serde_json::Value> = event
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), field_value_to_json(v)))
+            .collect();
+        // Carry the event type into evidence — `AlertIn` has no dedicated
+        // field for it, but it's valuable triage context server-side.
+        evidence.insert(
+            "event_type".to_string(),
+            serde_json::Value::from(event.event_type.clone()),
+        );
+
+        let alert = AgentAlert {
+            rule_name: rule_name.to_string(),
+            action_taken,
+            module: event.module.clone(),
+            ts: crate::util::time::now_iso8601(),
+            evidence: serde_json::Value::Object(evidence),
+        };
+        // Drop-on-full: alerts are best-effort relative to keeping the
+        // detection path non-blocking. The control side counts drops.
+        let _ = tx.try_send(alert);
     }
 
     /// Re-parse the rules file and atomically swap the engine. On parse

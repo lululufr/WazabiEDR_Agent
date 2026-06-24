@@ -57,6 +57,32 @@ pub struct AppConfig {
     /// `None` (or `enabled: false`) means the Waza detection layer is
     /// off — the agent behaves exactly as before this feature existed.
     pub detection: Option<DetectionConfig>,
+    /// `None` (or `enabled: false`) means the control plane (heartbeat /
+    /// profile sync / commands / alerts) is off. It additionally requires
+    /// a configured `shipper` section — that's where the server URL,
+    /// agent id and token come from.
+    pub control: Option<ControlConfig>,
+}
+
+/// Control-plane tunables. Opt-in: absent section ⇒ no control plane.
+/// Credentials (server_url / agent_id / token) are NOT here — they are
+/// shared with the `shipper` section.
+#[derive(Clone, Debug)]
+pub struct ControlConfig {
+    /// Fallback heartbeat cadence; the server's `next_checkin_seconds`
+    /// overrides it at runtime.
+    pub heartbeat_interval: Duration,
+    /// Forward Waza rule matches to `POST /agents/{id}/alerts`.
+    pub send_alerts: bool,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: Duration::from_secs(60),
+            send_alerts: true,
+        }
+    }
 }
 
 /// Waza detection-layer tunables. Opt-in: absent section ⇒ no detection.
@@ -132,6 +158,18 @@ struct ConfigFile {
     filter: Option<FilterSection>,
     #[serde(default)]
     detection: Option<DetectionSection>,
+    #[serde(default)]
+    control: Option<ControlSection>,
+}
+
+#[derive(Deserialize, Default)]
+struct ControlSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    heartbeat_interval_secs: Option<u64>,
+    #[serde(default)]
+    send_alerts: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -216,6 +254,7 @@ impl AppConfig {
                     shipper: None,
                     filter: None,
                     detection: None,
+                    control: None,
                 });
             }
             Err(e) => return Err(format!("read {:?}: {}", path, e)),
@@ -238,13 +277,29 @@ impl AppConfig {
             Some(d) if d.enabled.unwrap_or(false) => Some(resolve_detection(d)),
             _ => None,
         };
+        let control = match parsed.control {
+            Some(c) if c.enabled.unwrap_or(false) => Some(resolve_control(c)),
+            _ => None,
+        };
 
         Ok(Self {
             agent,
             shipper,
             filter: parsed.filter,
             detection,
+            control,
         })
+    }
+}
+
+fn resolve_control(s: ControlSection) -> ControlConfig {
+    let d = ControlConfig::default();
+    ControlConfig {
+        heartbeat_interval: s
+            .heartbeat_interval_secs
+            .map(|n| Duration::from_secs(n.max(1)))
+            .unwrap_or(d.heartbeat_interval),
+        send_alerts: s.send_alerts.unwrap_or(d.send_alerts),
     }
 }
 
@@ -404,6 +459,11 @@ fn write_default_config(path: &Path) -> Result<(), String> {
             "schema_path": "",
             "default_window_secs": 5,
             "reload_interval_secs": 5
+        },
+        "control": {
+            "enabled": false,
+            "heartbeat_interval_secs": 60,
+            "send_alerts": true
         }
     });
 

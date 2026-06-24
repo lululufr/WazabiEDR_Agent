@@ -144,3 +144,38 @@ struct EnrollResponse {
     // MVP n'en a pas besoin et serde::Deserialize tolère les champs
     // supplémentaires par défaut.
 }
+
+#[cfg(test)]
+mod tests {
+    //! Online tests — exercise the real `enroll::perform` against a
+    //! running Wazabi Server. `#[ignore]`d (need a server); run with
+    //! `cargo test -- --ignored` after setting `WAZABI_TEST_API_URL`.
+    use super::*;
+    use crate::test_support;
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn enroll_ok() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped enroll_ok — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let res = perform(&ts.url, &ts.enrollment_token, Duration::from_secs(15))
+            .expect("enroll should succeed");
+        assert!(!res.agent_id.trim().is_empty(), "agent_id must be set");
+        assert!(!res.agent_token.trim().is_empty(), "agent_token must be set");
+        eprintln!("[test] enrolled agent_id={}", res.agent_id);
+    }
+
+    #[test]
+    #[ignore = "online: needs a running Wazabi Server (set WAZABI_TEST_API_URL)"]
+    fn enroll_bad_token_is_rejected() {
+        let Some(ts) = test_support::server() else {
+            eprintln!("skipped enroll_bad_token_is_rejected — set WAZABI_TEST_API_URL");
+            return;
+        };
+        let err = perform(&ts.url, "definitely-not-the-token", Duration::from_secs(15))
+            .expect_err("a bad enrollment token must be rejected");
+        assert!(err.contains("401"), "expected HTTP 401, got: {err}");
+    }
+}

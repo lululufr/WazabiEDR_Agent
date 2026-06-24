@@ -30,6 +30,7 @@
 //! ```
 
 mod config;
+mod control;
 mod detection;
 mod filter;
 mod ipc;
@@ -39,7 +40,11 @@ mod shutdown;
 mod spool;
 mod util;
 
+#[cfg(test)]
+mod test_support;
+
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -81,6 +86,31 @@ fn main() -> io::Result<()> {
 
     let console_output = cfg.agent.console_output;
 
+    // Control plane (heartbeat / profile sync / commands / alerts) shares
+    // the shipper's server credentials, so it can only run when a shipper
+    // section is configured. Snapshot the creds before `cfg.shipper` is
+    // moved into the shipper below.
+    let server_creds = cfg.shipper.as_ref().map(|sc| control::ServerCreds {
+        server_url: sc.server_url.clone(),
+        agent_id: sc.agent_id.clone(),
+        token: sc.token.clone(),
+        verify_tls: sc.verify_tls,
+        timeout: sc.timeout,
+    });
+    let control_wanted = cfg.control.is_some() && server_creds.is_some();
+
+    // Alerts originate from the detection engine, so only wire the channel
+    // when control + detection + send_alerts are all on.
+    let send_alerts = control_wanted
+        && cfg.detection.is_some()
+        && cfg.control.as_ref().map(|c| c.send_alerts).unwrap_or(false);
+    let (alert_tx, alert_rx) = if send_alerts {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<detection::AgentAlert>(1024);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     // Waza detection layer. Opt-in via the `detection` config section.
     // A load failure (bad rules file) disables detection but is NOT fatal
     // — the agent keeps ingesting/shipping exactly as before. When loaded,
@@ -92,7 +122,7 @@ fn main() -> io::Result<()> {
             d.default_window,
         ) {
             Ok(engine) => {
-                let engine = Arc::new(engine);
+                let engine = Arc::new(engine.with_alert_sink(alert_tx));
                 let reload = detection::spawn_reload(Arc::clone(&engine), d.reload_interval);
                 (Some(engine), reload)
             }
@@ -192,6 +222,47 @@ fn main() -> io::Result<()> {
         }
     };
 
+    // Control plane. Needs both a `control` section and shipper creds.
+    let control_handle = match (cfg.control, server_creds) {
+        (Some(cc), Some(creds)) => {
+            // The server enforces {agent_id} == the Bearer's agent, so a
+            // non-UUID id (e.g. the %COMPUTERNAME% shipper fallback) will
+            // be rejected. Warn loudly rather than fail silently later.
+            if creds.agent_id.len() != 36 || !creds.agent_id.contains('-') {
+                eprintln!(
+                    "[control] WARNING: agent_id {:?} doesn't look like an enrolled UUID — \
+                     heartbeat/profile/alerts will be rejected (403/404). Enroll first.",
+                    creds.agent_id
+                );
+            }
+            let state_dir = config::default_path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let ctrl_cfg = control::ControlConfig {
+                creds,
+                heartbeat_interval: cc.heartbeat_interval,
+                send_alerts: cc.send_alerts,
+                state_dir,
+            };
+            match control::spawn_control(ctrl_cfg, alert_rx) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("[agent] control plane failed to spawn: {e}");
+                    None
+                }
+            }
+        }
+        (Some(_), None) => {
+            eprintln!(
+                "[control] disabled — a configured `shipper` section is required \
+                 for server credentials"
+            );
+            None
+        }
+        _ => None,
+    };
+
     eprintln!(
         "[agent] connected to \\\\.\\WazabiEDR (Ctrl+C to stop) — spool dir: {} — \
          plugins dir: {} — console_output: {}",
@@ -286,6 +357,22 @@ fn main() -> io::Result<()> {
         eprintln!(
             "[agent] shipper: {} batches sent, {} rejected, {} retries",
             sent, rejected, retries
+        );
+    }
+
+    if let Some(ch) = control_handle {
+        let cs = ch.stats();
+        let hb_ok = cs.heartbeats_ok.load(Ordering::Relaxed);
+        let hb_fail = cs.heartbeats_failed.load(Ordering::Relaxed);
+        let acked = cs.commands_acked.load(Ordering::Relaxed);
+        let syncs = cs.profile_syncs.load(Ordering::Relaxed);
+        let al_sent = cs.alerts_sent.load(Ordering::Relaxed);
+        let al_drop = cs.alerts_dropped.load(Ordering::Relaxed);
+        ch.shutdown();
+        eprintln!(
+            "[agent] control: {} heartbeats ({} failed), {} commands acked, \
+             {} profile syncs, {} alerts sent ({} dropped)",
+            hb_ok, hb_fail, acked, syncs, al_sent, al_drop
         );
     }
 
