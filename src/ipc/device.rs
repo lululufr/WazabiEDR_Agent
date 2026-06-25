@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, FALSE, GENERIC_READ, GetLastError, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_OPERATION_ABORTED, FALSE, GENERIC_READ,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -121,9 +121,14 @@ pub fn run_pump_loop(
                 continue;
             }
 
-            // ERROR_OPERATION_ABORTED (995) means our handle was cancelled
-            // — usually because we are shutting down or the driver was
-            // unloaded. Anything else is a genuine failure.
+            // ERROR_OPERATION_ABORTED (995) means our handle was
+            // cancelled by the Ctrl+C handler (CancelIoEx) or because
+            // the device closed under us. Treat as a clean shutdown
+            // signal rather than a failure -- otherwise the operator
+            // sees a noisy "error 995" line every time they Ctrl+C.
+            if err == ERROR_OPERATION_ABORTED {
+                break;
+            }
             eprintln!("[agent] DeviceIoControl failed: error {}", err);
             break;
         }

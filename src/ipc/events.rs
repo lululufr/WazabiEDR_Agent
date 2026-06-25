@@ -7,9 +7,11 @@
 /// Schema version we expect from the driver. Mismatched versions produce a
 /// parse error rather than a misinterpreted event.
 ///
-/// Bumped to 4 when `EventHeader::trunc_count` was added on the driver
-/// side (counter of fields truncated to fit fixed-size buffers).
-pub const EVENT_VERSION: u16 = 4;
+/// Bumped to 6 when `ProcessCreateEvent` gained `integrity_level` and
+/// `ProcessExitEvent` gained `exit_code` — the two extra fields that
+/// let detection rules express "elevation without UAC consent" and
+/// "process exited via TerminateProcess(non-zero)".
+pub const EVENT_VERSION: u16 = 6;
 
 pub const EVENT_TYPE_PROCESS_CREATE: u16 = 1;
 pub const EVENT_TYPE_PROCESS_EXIT: u16 = 2;
@@ -34,6 +36,12 @@ pub const HANDLE_ACCESS_OP_DUPLICATE: u16 = 2;
 /// Maximum number of UTF-16 code units the driver will send for an image
 /// path. Longer paths are truncated by the driver.
 pub const IMAGE_PATH_MAX: usize = 512;
+
+/// Maximum UTF-16 units for a process command line on the wire.
+pub const COMMAND_LINE_MAX: usize = 4096;
+
+/// Maximum UTF-16 units for the SDDL string form of a user SID on the wire.
+pub const USER_SID_MAX: usize = 192;
 
 /// Maximum number of UTF-16 code units shipped for a registry key path.
 pub const REGISTRY_KEY_PATH_MAX: usize = 512;
@@ -69,13 +77,42 @@ pub struct ProcessCreateEvent {
     pub image_path: [u16; IMAGE_PATH_MAX],
     /// UTF-16 character count (NOT bytes), no terminating NUL.
     pub image_path_len: u16,
+    /// Command line of the new process. Empty (`command_line_len == 0`)
+    /// when the kernel didn't supply one — see driver-side comment.
+    pub command_line: [u16; COMMAND_LINE_MAX],
+    pub command_line_len: u16,
+    /// NT path of the parent's executable. Empty when the parent had
+    /// already exited or the kernel lookup failed.
+    pub parent_image_path: [u16; IMAGE_PATH_MAX],
+    pub parent_image_path_len: u16,
+    /// SDDL string form of the primary token's user SID, e.g.
+    /// `S-1-5-21-…-1001`. Empty when the token wasn't resolvable.
+    pub user_sid: [u16; USER_SID_MAX],
+    pub user_sid_len: u16,
+    /// Last sub-authority of the TokenIntegrityLevel SID
+    /// (`S-1-16-XXXX`). Common values: 0x1000=Low, 0x2000=Medium,
+    /// 0x3000=High, 0x4000=System. `0xFFFFFFFF` = unresolved.
+    pub integrity_level: u32,
 }
+
+// Wire-format byte-identity guard — driver-side has the same const _
+// assertions on the same expected values. If anyone changes a field
+// width or reorders here without the equivalent kernel change, this
+// fails to compile rather than silently producing garbage events at
+// runtime.
+const _: () = assert!(std::mem::size_of::<EventHeader>() == 24);
+const _: () = assert!(std::mem::size_of::<ProcessCreateEvent>() == 10672);
+const _: () = assert!(std::mem::size_of::<ProcessExitEvent>() == 32);
 
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 pub struct ProcessExitEvent {
     pub header: EventHeader,
     pub process_id: u32,
+    /// Exit status as returned by `PsGetProcessExitStatus`. Mirrors the
+    /// driver-side comment: 0 = clean, non-zero = explicit exit code or
+    /// NTSTATUS from `TerminateProcess`.
+    pub exit_code: i32,
 }
 
 /// Image-load event.

@@ -32,9 +32,11 @@
 mod config;
 mod control;
 mod detection;
+mod etw;
 mod filter;
 mod ipc;
 mod plugin;
+mod polling;
 mod shipper;
 mod shutdown;
 mod spool;
@@ -61,6 +63,34 @@ const PLUGIN_SPOOL_SUBDIR: &str = "plugins";
 fn main() -> io::Result<()> {
     shutdown::install();
 
+    // Force-exit watchdog. Even with CancelIoEx on the pump handle,
+    // a handful of threads can stall in non-cancellable syscalls when
+    // we ask them to stop:
+    //   - the shipper + control-plane http requests (ureq has no
+    //     cancellation API; worst case = full `timeout_secs` wait,
+    //     30s default)
+    //   - the plugin server's named-pipe accept() (blocked until a
+    //     client connects)
+    //   - long-running ETW providers between events
+    // After SHUTDOWN flips, we give every cooperating thread 8s to
+    // exit on its own. Past that, we exit(0) -- the alternative is
+    // Ctrl+C that appears to do nothing, which is worse than losing
+    // a few in-flight retries.
+    std::thread::Builder::new()
+        .name("wedr-force-exit".into())
+        .spawn(|| {
+            // Block until shutdown is requested.
+            while !shutdown::SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            // Grace period for cooperative shutdown.
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            eprintln!("[agent] shutdown grace period elapsed -- forcing exit");
+            let _ = io::stderr().flush();
+            std::process::exit(0);
+        })
+        .expect("spawn force-exit watchdog");
+
     // The agent takes no CLI flags. Any argument is treated as a
     // request for the help message — typing `--help`, `-h`, or just
     // bumping into the binary with `WazabiEDR_Agent foo` all point
@@ -83,6 +113,12 @@ fn main() -> io::Result<()> {
     filter::init(cfg.filter.clone());
 
     let handle = open_device()?;
+    // Register the device handle with the Ctrl+C handler so it can
+    // CancelIoEx the pump's DeviceIoControl on shutdown -- otherwise
+    // the pump thread stays parked in a blocking syscall when the
+    // driver isn't pushing events (typical when version mismatches
+    // and every event is silently rejected).
+    shutdown::register_pump_handle(handle);
 
     let console_output = cfg.agent.console_output;
 
@@ -218,6 +254,28 @@ fn main() -> io::Result<()> {
         }
         None => {
             eprintln!("[agent] no shipper configured — events stay on disk only");
+            None
+        }
+    };
+
+    // ETW consumer. Re-uses the kernel spool — ETW events are the same
+    // shape of telemetry conceptually, just sourced from user-mode. Opt-in
+    // via the `etw` config section; failure (privilege missing, provider
+    // unavailable) is non-fatal — the agent keeps running.
+    let etw_handle = match cfg.etw.clone() {
+        Some(etw_cfg) => etw::spawn(etw_cfg, kernel_spool.submitter()),
+        None => {
+            eprintln!("[etw] disabled (no [etw] config section)");
+            None
+        }
+    };
+
+    // Persistence polling: services + scheduled tasks diff loop. Same
+    // opt-in / non-fatal pattern as ETW.
+    let polling_handle = match cfg.polling.clone() {
+        Some(p_cfg) => polling::spawn(p_cfg, kernel_spool.submitter()),
+        None => {
+            eprintln!("[polling] disabled (no [polling] config section)");
             None
         }
     };
@@ -373,6 +431,34 @@ fn main() -> io::Result<()> {
             "[agent] control: {} heartbeats ({} failed), {} commands acked, \
              {} profile syncs, {} alerts sent ({} dropped)",
             hb_ok, hb_fail, acked, syncs, al_sent, al_drop
+        );
+    }
+
+    if let Some(eh) = etw_handle {
+        let s = &eh.stats;
+        let dns = s.dns.load(Ordering::Relaxed);
+        let tcp = s.tcp.load(Ordering::Relaxed);
+        let ps = s.powershell.load(Ordering::Relaxed);
+        let wmi = s.wmi.load(Ordering::Relaxed);
+        let tls = s.schannel.load(Ordering::Relaxed);
+        let amsi = s.amsi.load(Ordering::Relaxed);
+        let drop = s.dropped.load(Ordering::Relaxed);
+        eh.shutdown();
+        eprintln!(
+            "[agent] etw: dns={} tcp={} ps={} wmi={} tls={} amsi={} dropped={}",
+            dns, tcp, ps, wmi, tls, amsi, drop
+        );
+    }
+
+    if let Some(ph) = polling_handle {
+        let s = &ph.stats;
+        let svc = s.service_events.load(Ordering::Relaxed);
+        let tasks = s.task_events.load(Ordering::Relaxed);
+        let drop = s.dropped.load(Ordering::Relaxed);
+        ph.shutdown();
+        eprintln!(
+            "[agent] polling: services={} tasks={} dropped={}",
+            svc, tasks, drop
         );
     }
 

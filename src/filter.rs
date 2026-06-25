@@ -25,6 +25,16 @@
 //! "plugin"` — donc l'allow-list contrôle le canal entier (on/off), pas
 //! le `kind` interne du plugin. Filtrer par `kind` viendra avec les
 //! règles Waza côté agent.
+//!
+//! # Scope
+//!
+//! Le filtre s'applique aux events **kernel** (driver → agent) émis via
+//! `ipc::json::encode_kernel_event`. Les events `module=etw` (Phase B)
+//! et `module=persistence` (Phase C) ne passent **pas** par cette
+//! allow-list : ils sont filtrés à la source (chaque provider ETW
+//! choisit déjà ses event IDs ; le polling diffuse seulement les
+//! diffs). On/off de ces canaux se fait via les sections `etw.*` et
+//! `polling.*` de `agent.json`, pas via `filter.modules`.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;

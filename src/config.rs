@@ -39,7 +39,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::etw::EtwConfig;
 use crate::filter::FilterSection;
+use crate::polling::PollingConfig;
 use crate::shipper::config::{ShipperConfig, ShipperSection, resolve_shipper};
 
 /// Default location of the config file: `%ProgramData%\WazabiEDR\agent.json`.
@@ -62,6 +64,15 @@ pub struct AppConfig {
     /// a configured `shipper` section — that's where the server URL,
     /// agent id and token come from.
     pub control: Option<ControlConfig>,
+    /// `None` (or `enabled: false`) means the ETW consumer is off. When
+    /// on, the agent spawns one trace session subscribed to DNS / TCP /
+    /// PowerShell / WMI / Schannel / AMSI providers (each independently
+    /// toggleable). Output events are pushed into the kernel spool.
+    pub etw: Option<EtwConfig>,
+    /// `None` (or `enabled: false`) means the user-mode persistence
+    /// polling is off (services + scheduled tasks). When on, two
+    /// dedicated threads diff snapshots at the configured cadence.
+    pub polling: Option<PollingConfig>,
 }
 
 /// Control-plane tunables. Opt-in: absent section ⇒ no control plane.
@@ -140,7 +151,11 @@ impl Default for AgentConfig {
             max_total_bytes: 256 * 1024 * 1024,
             channel_capacity: 1024,
             zstd_level: 3,
-            console_output: true,
+            // Off by default: in production the agent runs as a Windows
+            // service (no console attached) and `console_output=true`
+            // would just burn CPU formatting human lines no one reads.
+            // Operators flip it to true ad-hoc when debugging.
+            console_output: false,
         }
     }
 }
@@ -160,6 +175,42 @@ struct ConfigFile {
     detection: Option<DetectionSection>,
     #[serde(default)]
     control: Option<ControlSection>,
+    #[serde(default)]
+    etw: Option<EtwSection>,
+    #[serde(default)]
+    polling: Option<PollingSection>,
+}
+
+#[derive(Deserialize, Default)]
+struct EtwSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    dns: Option<bool>,
+    #[serde(default)]
+    tcp: Option<bool>,
+    #[serde(default)]
+    powershell: Option<bool>,
+    #[serde(default)]
+    wmi: Option<bool>,
+    #[serde(default)]
+    schannel: Option<bool>,
+    #[serde(default)]
+    amsi: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+struct PollingSection {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    services: Option<bool>,
+    #[serde(default)]
+    scheduled_tasks: Option<bool>,
+    #[serde(default)]
+    interval_secs: Option<u64>,
+    #[serde(default)]
+    silent_first_snapshot: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -255,6 +306,8 @@ impl AppConfig {
                     filter: None,
                     detection: None,
                     control: None,
+                    etw: None,
+                    polling: None,
                 });
             }
             Err(e) => return Err(format!("read {:?}: {}", path, e)),
@@ -281,6 +334,14 @@ impl AppConfig {
             Some(c) if c.enabled.unwrap_or(false) => Some(resolve_control(c)),
             _ => None,
         };
+        let etw = match parsed.etw {
+            Some(e) if e.enabled.unwrap_or(false) => Some(resolve_etw(e)),
+            _ => None,
+        };
+        let polling = match parsed.polling {
+            Some(p) if p.enabled.unwrap_or(false) => Some(resolve_polling(p)),
+            _ => None,
+        };
 
         Ok(Self {
             agent,
@@ -288,7 +349,34 @@ impl AppConfig {
             filter: parsed.filter,
             detection,
             control,
+            etw,
+            polling,
         })
+    }
+}
+
+fn resolve_polling(s: PollingSection) -> PollingConfig {
+    let d = PollingConfig::default();
+    PollingConfig {
+        services: s.services.unwrap_or(d.services),
+        scheduled_tasks: s.scheduled_tasks.unwrap_or(d.scheduled_tasks),
+        interval: s
+            .interval_secs
+            .map(|n| std::time::Duration::from_secs(n.max(5)))
+            .unwrap_or(d.interval),
+        silent_first_snapshot: s.silent_first_snapshot.unwrap_or(d.silent_first_snapshot),
+    }
+}
+
+fn resolve_etw(s: EtwSection) -> EtwConfig {
+    let d = EtwConfig::default();
+    EtwConfig {
+        dns: s.dns.unwrap_or(d.dns),
+        tcp: s.tcp.unwrap_or(d.tcp),
+        powershell: s.powershell.unwrap_or(d.powershell),
+        wmi: s.wmi.unwrap_or(d.wmi),
+        schannel: s.schannel.unwrap_or(d.schannel),
+        amsi: s.amsi.unwrap_or(d.amsi),
     }
 }
 
@@ -428,15 +516,14 @@ fn write_default_config(path: &Path) -> Result<(), String> {
     }
 
     let d = AgentConfig::default();
+    let cc = ControlConfig::default();
+    let dc = DetectionConfig::default();
+    // Default skeleton. Everything that needs operator input lives in
+    // `shipper` (server URL + enrollment token). The rest is the
+    // production posture: control + ETW + polling ON, detection OFF
+    // (no .waza rules deployed yet), console_output OFF (we run as a
+    // service in prod, no stdout consumer).
     let skeleton = serde_json::json!({
-        "_comment": "WazabiEDR agent — auto-generated default config. \
-                     For auto-enrollment: set shipper.enabled=true, \
-                     shipper.server_url, shipper.enrollment_token (matching \
-                     ENROLLMENT_TOKEN on the server) and restart. The agent \
-                     will call POST /api/v1/agents/enroll, then rewrite this \
-                     file with agent_id + token_plain (and remove \
-                     enrollment_token). See \
-                     WazabiEDR_Doc/usage/configuring-shipper.md for details.",
         "agent": {
             "console_output": d.console_output,
             "spool_dir": d.spool_dir.to_string_lossy(),
@@ -448,22 +535,42 @@ fn write_default_config(path: &Path) -> Result<(), String> {
         },
         "shipper": {
             "enabled": false,
-            "server_url": "https://wazabi.example.com",
+            "server_url": "http://127.0.0.1:8080",
             "enrollment_token": "",
             "agent_id": "",
-            "token_plain": ""
+            "token_plain": "",
+            "verify_tls": true,
+            "timeout_secs": 30,
+            "poll_interval_secs": 5,
+            "max_backoff_secs": 300
+        },
+        "control": {
+            "enabled": true,
+            "heartbeat_interval_secs": cc.heartbeat_interval.as_secs(),
+            "send_alerts": cc.send_alerts
         },
         "detection": {
             "enabled": false,
-            "rules_path": default_rules_path().to_string_lossy(),
+            "rules_path": dc.rules_path.to_string_lossy(),
             "schema_path": "",
-            "default_window_secs": 5,
-            "reload_interval_secs": 5
+            "default_window_secs": dc.default_window.as_secs(),
+            "reload_interval_secs": dc.reload_interval.as_secs()
         },
-        "control": {
-            "enabled": false,
-            "heartbeat_interval_secs": 60,
-            "send_alerts": true
+        "etw": {
+            "enabled": true,
+            "dns": true,
+            "tcp": true,
+            "powershell": true,
+            "wmi": true,
+            "schannel": true,
+            "amsi": true
+        },
+        "polling": {
+            "enabled": true,
+            "services": true,
+            "scheduled_tasks": true,
+            "interval_secs": 30,
+            "silent_first_snapshot": true
         }
     });
 

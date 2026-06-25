@@ -8,14 +8,14 @@ use std::mem::size_of;
 use std::ptr;
 
 use crate::ipc::events::{
-    EVENT_TYPE_IMAGE_LOAD, EVENT_TYPE_PROCESS_CREATE, EVENT_TYPE_PROCESS_EXIT,
+    COMMAND_LINE_MAX, EVENT_TYPE_IMAGE_LOAD, EVENT_TYPE_PROCESS_CREATE, EVENT_TYPE_PROCESS_EXIT,
     EVENT_TYPE_PROCESS_HANDLE_ACCESS, EVENT_TYPE_REGISTRY_MODIFY, EVENT_TYPE_THREAD_CREATE,
     EVENT_TYPE_THREAD_EXIT, EVENT_VERSION, EventHeader, HANDLE_ACCESS_OP_CREATE,
     HANDLE_ACCESS_OP_DUPLICATE, IMAGE_PATH_MAX, ImageLoadEvent, ProcessCreateEvent,
     ProcessExitEvent, ProcessHandleAccessEvent, REGISTRY_DATA_PREVIEW_MAX, REGISTRY_KEY_PATH_MAX,
     REGISTRY_OP_CREATE_KEY, REGISTRY_OP_DELETE_KEY, REGISTRY_OP_DELETE_VALUE,
     REGISTRY_OP_RENAME_KEY, REGISTRY_OP_SET_VALUE, REGISTRY_VALUE_NAME_MAX, RegistryEvent,
-    ThreadCreateEvent, ThreadExitEvent,
+    ThreadCreateEvent, ThreadExitEvent, USER_SID_MAX,
 };
 use crate::util::time::format_timestamp;
 
@@ -157,30 +157,71 @@ fn print_process_create(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(),
     let ppid = evt.parent_process_id;
     let cpid = evt.creating_process_id;
     let path_len = evt.image_path_len as usize;
+    let cmd_len = evt.command_line_len as usize;
+    let parent_len = evt.parent_image_path_len as usize;
+    let sid_len = evt.user_sid_len as usize;
 
     let image_path =
         unsafe { decode_packed_path::<IMAGE_PATH_MAX>(ptr::addr_of!(evt.image_path), path_len) };
+    let command_line = unsafe {
+        decode_packed_path::<COMMAND_LINE_MAX>(ptr::addr_of!(evt.command_line), cmd_len)
+    };
+    let parent_path = unsafe {
+        decode_packed_path::<IMAGE_PATH_MAX>(
+            ptr::addr_of!(evt.parent_image_path),
+            parent_len,
+        )
+    };
+    let user_sid =
+        unsafe { decode_packed_path::<USER_SID_MAX>(ptr::addr_of!(evt.user_sid), sid_len) };
+
+    let il = evt.integrity_level;
+    let il_label = integrity_label(il);
 
     println!(
-        "[{}] ProcessCreate pid={} ppid={} creator={} path=\"{}\"{}{}",
+        "[{}] ProcessCreate pid={} ppid={} creator={} user=\"{}\" il={} parent=\"{}\" path=\"{}\" cmd=\"{}\"{}{}",
         format_timestamp(ctx.timestamp),
         pid,
         ppid,
         cpid,
+        user_sid,
+        il_label,
+        parent_path,
         image_path,
+        command_line,
         ctx.drop_marker,
         ctx.trunc_marker
     );
     Ok(())
 }
 
+/// Map a TokenIntegrityLevel RID to a human label. Unknown / unresolved
+/// values fall back to an explicit `il=?(0xHEX)` form so the operator
+/// sees the raw value rather than a silently-wrong label.
+fn integrity_label(rid: u32) -> String {
+    match rid {
+        0x0000 => "untrusted".to_string(),
+        0x1000 => "low".to_string(),
+        0x2000 => "medium".to_string(),
+        0x2100 => "medium+".to_string(),
+        0x3000 => "high".to_string(),
+        0x4000 => "system".to_string(),
+        0x5000 => "protected".to_string(),
+        0xFFFFFFFF => "?".to_string(),
+        other => format!("?(0x{:x})", other),
+    }
+}
+
 fn print_process_exit(buf: &[u8], size: u32, ctx: &EventCtx<'_>) -> Result<(), String> {
     let evt: ProcessExitEvent = unsafe { read_packed_event(buf, size, "ProcessExit")? };
     let pid = evt.process_id;
+    let code = evt.exit_code;
     println!(
-        "[{}] ProcessExit  pid={}{}{}",
+        "[{}] ProcessExit  pid={} exit=0x{:x} ({}){}{}",
         format_timestamp(ctx.timestamp),
         pid,
+        code as u32,
+        code,
         ctx.drop_marker,
         ctx.trunc_marker
     );

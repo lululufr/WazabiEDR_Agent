@@ -73,7 +73,16 @@ pub fn run(
                 // performs a real action (kill_process today) or returns
                 // "completed/no-op" with a clear note — either way the
                 // server's PENDING queue drains.
+                // `update_rules` is special: the executor itself is a
+                // no-op (no payload to apply), but seeing one in the
+                // pending list means the admin clicked "Re-pull profil"
+                // and we want to force a sync this iteration even if the
+                // server-side version hasn't moved.
+                let mut force_profile_pull = false;
                 for cmd in &resp.pending_commands {
+                    if cmd.cmd_type == "update_rules" {
+                        force_profile_pull = true;
+                    }
                     let outcome = executor::execute(cmd);
                     let final_status = outcome.status;
                     match client.ack_command(&cmd.id, final_status, outcome.result) {
@@ -98,9 +107,10 @@ pub fn run(
                     };
                     s.version
                 };
-                if resp.current_profile_version > local {
+                if resp.current_profile_version > local || force_profile_pull {
                     eprintln!(
-                        "[control] profile change v{} → v{}, syncing…",
+                        "[control] profile {} v{} → v{}, syncing…",
+                        if force_profile_pull { "re-pull forced" } else { "change" },
                         local, resp.current_profile_version
                     );
                     if let Err(e) = sync::pull(client, &state, state_dir, stats) {

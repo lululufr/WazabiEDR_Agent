@@ -27,14 +27,14 @@ use serde::Serialize;
 use crate::detection::event::LogEvent;
 use crate::detection::flatten_fields;
 use crate::ipc::events::{
-    EVENT_TYPE_IMAGE_LOAD, EVENT_TYPE_PROCESS_CREATE, EVENT_TYPE_PROCESS_EXIT,
+    COMMAND_LINE_MAX, EVENT_TYPE_IMAGE_LOAD, EVENT_TYPE_PROCESS_CREATE, EVENT_TYPE_PROCESS_EXIT,
     EVENT_TYPE_PROCESS_HANDLE_ACCESS, EVENT_TYPE_REGISTRY_MODIFY, EVENT_TYPE_THREAD_CREATE,
     EVENT_TYPE_THREAD_EXIT, EVENT_VERSION, EventHeader, HANDLE_ACCESS_OP_CREATE,
     HANDLE_ACCESS_OP_DUPLICATE, IMAGE_PATH_MAX, ImageLoadEvent, ProcessCreateEvent,
     ProcessExitEvent, ProcessHandleAccessEvent, REGISTRY_DATA_PREVIEW_MAX, REGISTRY_KEY_PATH_MAX,
     REGISTRY_OP_CREATE_KEY, REGISTRY_OP_DELETE_KEY, REGISTRY_OP_DELETE_VALUE,
     REGISTRY_OP_RENAME_KEY, REGISTRY_OP_SET_VALUE, REGISTRY_VALUE_NAME_MAX, RegistryEvent,
-    ThreadCreateEvent, ThreadExitEvent,
+    ThreadCreateEvent, ThreadExitEvent, USER_SID_MAX,
 };
 use crate::util::time::format_timestamp;
 
@@ -106,6 +106,19 @@ struct ProcessSlim {
     name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+    /// Server's `ProcessInfo.command_line`. Populated for `process_create`
+    /// events (the kernel ships it via `PS_CREATE_NOTIFY_INFO`); skipped
+    /// for events that don't carry one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_line: Option<String>,
+    /// Server's `ProcessInfo.user`. We ship the **SDDL SID** (e.g.
+    /// `S-1-5-21-…-1001`) rather than `DOMAIN\user` because resolving in
+    /// the kernel callback would require either an LSA lookup (paged,
+    /// can recurse into network for domain SIDs) or a user-mode cache
+    /// (extra dependency on each event). The server / SIEM is the right
+    /// place to do that resolution lazily.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
 }
 
 /// Extract a process executable name from a kernel path. Handles both NT
@@ -148,11 +161,23 @@ fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
     let name = path.as_deref().and_then(basename);
+    let command_line = payload
+        .get("command_line")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let user = payload
+        .get("user_sid")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
     Some(ProcessSlim {
         pid,
         ppid,
         name,
         path,
+        command_line,
+        user,
     })
 }
 
@@ -344,20 +369,90 @@ fn encode_process_create(buf: &[u8], size: u32) -> Result<serde_json::Value, Str
     let pid = evt.process_id;
     let ppid = evt.parent_process_id;
     let cpid = evt.creating_process_id;
-    let len = evt.image_path_len as usize;
-    let image_path = unsafe { decode_path::<IMAGE_PATH_MAX>(ptr::addr_of!(evt.image_path), len) };
-    Ok(serde_json::json!({
+    let path_len = evt.image_path_len as usize;
+    let cmd_len = evt.command_line_len as usize;
+    let parent_len = evt.parent_image_path_len as usize;
+    let sid_len = evt.user_sid_len as usize;
+
+    let image_path =
+        unsafe { decode_path::<IMAGE_PATH_MAX>(ptr::addr_of!(evt.image_path), path_len) };
+    let command_line =
+        unsafe { decode_path::<COMMAND_LINE_MAX>(ptr::addr_of!(evt.command_line), cmd_len) };
+    let parent_image_path = unsafe {
+        decode_path::<IMAGE_PATH_MAX>(ptr::addr_of!(evt.parent_image_path), parent_len)
+    };
+    let user_sid = unsafe { decode_path::<USER_SID_MAX>(ptr::addr_of!(evt.user_sid), sid_len) };
+
+    // Pre-compute the parent's basename so detection rules can match on
+    // `kernel_callback.process_create.parent_name` without having to
+    // re-derive it from the path on every event.
+    let parent_image_name = if parent_image_path.is_empty() {
+        String::new()
+    } else {
+        basename(&parent_image_path).unwrap_or_default()
+    };
+
+    let mut payload = serde_json::json!({
         "pid": pid,
         "parent_pid": ppid,
         "creating_pid": cpid,
         "image_path": image_path,
-    }))
+    });
+    let obj = payload.as_object_mut().expect("just built as object");
+    // Each enrichment is skipped when empty — keeps the OpenSearch index
+    // mapping stable and avoids storing useless `""` for fields the
+    // kernel couldn't resolve.
+    if !command_line.is_empty() {
+        obj.insert("command_line".into(), command_line.into());
+    }
+    if !parent_image_path.is_empty() {
+        obj.insert("parent_image_path".into(), parent_image_path.into());
+    }
+    if !parent_image_name.is_empty() {
+        obj.insert("parent_image_name".into(), parent_image_name.into());
+    }
+    if !user_sid.is_empty() {
+        obj.insert("user_sid".into(), user_sid.into());
+    }
+    // Integrity level: skip the 0xFFFFFFFF sentinel so the field isn't
+    // indexed for events where the kernel couldn't resolve it. Otherwise
+    // expose BOTH the raw RID (machine-friendly, filterable) and the
+    // human label (SIEM-friendly, "il:high" queries).
+    let il = evt.integrity_level;
+    if il != 0xFFFF_FFFF {
+        obj.insert("integrity_level".into(), il.into());
+        obj.insert(
+            "integrity_label".into(),
+            integrity_label_str(il).into(),
+        );
+    }
+    Ok(payload)
+}
+
+fn integrity_label_str(rid: u32) -> &'static str {
+    match rid {
+        0x0000 => "untrusted",
+        0x1000 => "low",
+        0x2000 => "medium",
+        0x2100 => "medium_plus",
+        0x3000 => "high",
+        0x4000 => "system",
+        0x5000 => "protected",
+        _ => "unknown",
+    }
 }
 
 fn encode_process_exit(buf: &[u8], size: u32) -> Result<serde_json::Value, String> {
     let evt: ProcessExitEvent = unsafe { read_packed(buf, size, "ProcessExit")? };
     let pid = evt.process_id;
-    Ok(serde_json::json!({ "pid": pid }))
+    let exit_code = evt.exit_code;
+    Ok(serde_json::json!({
+        "pid": pid,
+        "exit_code": exit_code,
+        // Convenience flag for SIEM rules: non-zero is either explicit
+        // exit code or TerminateProcess from another process.
+        "clean_exit": exit_code == 0,
+    }))
 }
 
 fn encode_image_load(buf: &[u8], size: u32) -> Result<serde_json::Value, String> {
@@ -496,3 +591,218 @@ fn encode_handle_access(buf: &[u8], size: u32) -> Result<serde_json::Value, Stri
         "op_code": op,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    //! Wire-format → JSON round-trip tests.
+    //!
+    //! These exercise `encode_kernel_event` on a hand-built packed buffer
+    //! that mimics what the driver actually ships, then asserts the JSON
+    //! envelope contains the enrichments the server-side `EventIn` schema
+    //! expects (see `WazabiEDR_Server/app/schemas/event.py` +
+    //! `_common.py::ProcessInfo`).
+    //!
+    //! Catching a wire / serializer drift here is way cheaper than
+    //! discovering it via `validation skipped, …` lines in production
+    //! agent logs.
+
+    use super::*;
+    use crate::ipc::events::{
+        COMMAND_LINE_MAX, EVENT_TYPE_PROCESS_CREATE, EVENT_TYPE_PROCESS_EXIT, EVENT_VERSION,
+        EventHeader, IMAGE_PATH_MAX, ProcessCreateEvent, ProcessExitEvent, USER_SID_MAX,
+    };
+    use std::mem::size_of;
+
+    /// Write a UTF-16 string into a packed-struct array field via raw
+    /// pointers (`&mut field` on a packed struct is UB) and return the
+    /// number of u16 units written. Mirrors what the driver does.
+    unsafe fn fill_packed_u16<const N: usize>(
+        arr_ptr: *mut [u16; N],
+        s: &str,
+    ) -> u16 {
+        let utf16: Vec<u16> = s.encode_utf16().collect();
+        let n = utf16.len().min(N - 1);
+        unsafe {
+            let dst = arr_ptr as *mut u16;
+            ptr::copy_nonoverlapping(utf16.as_ptr(), dst, n);
+        }
+        n as u16
+    }
+
+    fn fake_process_create_buffer() -> Vec<u8> {
+        // Allocate the byte buffer first, then write each packed field
+        // through raw pointers — same pattern as the kernel callback
+        // (which can't form &mut on packed-struct fields either).
+        let size = size_of::<ProcessCreateEvent>();
+        let mut bytes = vec![0u8; size];
+        let evt = bytes.as_mut_ptr() as *mut ProcessCreateEvent;
+        unsafe {
+            // Header
+            ptr::write_unaligned(
+                ptr::addr_of_mut!((*evt).header),
+                EventHeader {
+                    version: EVENT_VERSION,
+                    type_: EVENT_TYPE_PROCESS_CREATE,
+                    timestamp: 133_634_820_000_000_000,
+                    size: size as u32,
+                    drop_count: 0,
+                    trunc_count: 0,
+                },
+            );
+            // Numeric tail
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).process_id), 4823u32);
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).parent_process_id), 824u32);
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).creating_process_id), 824u32);
+            // String tails
+            let img_len = fill_packed_u16::<IMAGE_PATH_MAX>(
+                ptr::addr_of_mut!((*evt).image_path),
+                r"\Device\HarddiskVolume3\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            );
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).image_path_len), img_len);
+            let cmd_len = fill_packed_u16::<COMMAND_LINE_MAX>(
+                ptr::addr_of_mut!((*evt).command_line),
+                "powershell.exe -EncodedCommand SQBFAFgA",
+            );
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).command_line_len), cmd_len);
+            let parent_len = fill_packed_u16::<IMAGE_PATH_MAX>(
+                ptr::addr_of_mut!((*evt).parent_image_path),
+                r"\Device\HarddiskVolume3\Windows\explorer.exe",
+            );
+            ptr::write_unaligned(
+                ptr::addr_of_mut!((*evt).parent_image_path_len),
+                parent_len,
+            );
+            let sid_len = fill_packed_u16::<USER_SID_MAX>(
+                ptr::addr_of_mut!((*evt).user_sid),
+                "S-1-5-21-1004336348-1177238915-682003330-1001",
+            );
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).user_sid_len), sid_len);
+            // High integrity (elevated admin) — typical for a powershell.exe
+            // launched from an admin desktop session.
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).integrity_level), 0x3000u32);
+        }
+        bytes
+    }
+
+    fn fake_process_exit_buffer(exit_code: i32) -> Vec<u8> {
+        let size = size_of::<ProcessExitEvent>();
+        let mut bytes = vec![0u8; size];
+        let evt = bytes.as_mut_ptr() as *mut ProcessExitEvent;
+        unsafe {
+            ptr::write_unaligned(
+                ptr::addr_of_mut!((*evt).header),
+                EventHeader {
+                    version: EVENT_VERSION,
+                    type_: EVENT_TYPE_PROCESS_EXIT,
+                    timestamp: 133_634_820_000_000_001,
+                    size: size as u32,
+                    drop_count: 0,
+                    trunc_count: 0,
+                },
+            );
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).process_id), 4823u32);
+            ptr::write_unaligned(ptr::addr_of_mut!((*evt).exit_code), exit_code);
+        }
+        bytes
+    }
+
+    #[test]
+    fn process_create_v6_envelope_matches_server_schema() {
+        let buf = fake_process_create_buffer();
+        let bytes = encode_kernel_event(&buf)
+            .expect("encode should succeed")
+            .expect("filter should not drop process_create by default");
+        // Strip the trailing newline so serde_json doesn't trip on it.
+        let text = std::str::from_utf8(&bytes).expect("UTF-8 NDJSON");
+        let text = text.trim_end_matches('\n');
+        let v: serde_json::Value = serde_json::from_str(text).expect("valid JSON");
+
+        // Top-level envelope (mirrors KernelEnvelope → EventIn).
+        assert_eq!(v["module"], "kernel_callback");
+        assert_eq!(v["event_type"], "process_create");
+        assert_eq!(v["source"], "kernel");
+        assert_eq!(v["event_version"], EVENT_VERSION);
+
+        // Server-validated `process` block — every field here must exist
+        // in `ProcessInfo` or Pydantic will silently drop it.
+        let proc = &v["process"];
+        assert_eq!(proc["pid"], 4823);
+        assert_eq!(proc["ppid"], 824);
+        assert_eq!(proc["name"], "powershell.exe");
+        assert!(
+            proc["path"].as_str().unwrap().ends_with("powershell.exe"),
+            "path: {:?}",
+            proc["path"],
+        );
+        assert!(
+            proc["command_line"]
+                .as_str()
+                .unwrap()
+                .starts_with("powershell.exe"),
+            "command_line: {:?}",
+            proc["command_line"],
+        );
+        assert_eq!(
+            proc["user"],
+            "S-1-5-21-1004336348-1177238915-682003330-1001"
+        );
+
+        // `raw` is the server's free-form bag — everything kernel-specific
+        // lives here for SIEM queries (no schema constraint).
+        let raw = &v["raw"];
+        assert_eq!(raw["pid"], 4823);
+        assert_eq!(raw["parent_pid"], 824);
+        assert_eq!(raw["creating_pid"], 824);
+        assert!(raw["image_path"].as_str().unwrap().contains("powershell"));
+        assert!(raw["command_line"].as_str().unwrap().contains("EncodedCommand"));
+        assert!(
+            raw["parent_image_path"]
+                .as_str()
+                .unwrap()
+                .ends_with("explorer.exe"),
+        );
+        assert_eq!(raw["parent_image_name"], "explorer.exe");
+        assert_eq!(
+            raw["user_sid"],
+            "S-1-5-21-1004336348-1177238915-682003330-1001"
+        );
+        // v6 enrichment: integrity_level (raw RID + human label).
+        assert_eq!(raw["integrity_level"], 0x3000);
+        assert_eq!(raw["integrity_label"], "high");
+    }
+
+    #[test]
+    fn process_exit_v6_envelope_carries_exit_code() {
+        // Non-zero exit — typical of TerminateProcess(STATUS_ACCESS_VIOLATION).
+        let buf = fake_process_exit_buffer(0xC000_0005u32 as i32);
+        let bytes = encode_kernel_event(&buf)
+            .expect("encode should succeed")
+            .expect("filter should not drop process_terminate by default");
+        let text = std::str::from_utf8(&bytes).unwrap().trim_end_matches('\n');
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["event_type"], "process_terminate");
+        assert_eq!(v["event_version"], EVENT_VERSION);
+        // exit_code is i32; the JSON number encodes the signed value.
+        assert_eq!(v["raw"]["exit_code"].as_i64().unwrap(), 0xC000_0005u32 as i32 as i64);
+        assert_eq!(v["raw"]["clean_exit"], false);
+
+        // Clean exit case.
+        let buf = fake_process_exit_buffer(0);
+        let bytes = encode_kernel_event(&buf).unwrap().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap().trim_end_matches('\n');
+        let v: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(v["raw"]["exit_code"], 0);
+        assert_eq!(v["raw"]["clean_exit"], true);
+    }
+
+    #[test]
+    fn process_create_rejects_old_version() {
+        let mut buf = fake_process_create_buffer();
+        // Stamp version 5 (previous schema). Parser must refuse it
+        // rather than misinterpret the bytes.
+        buf[0..2].copy_from_slice(&5u16.to_le_bytes());
+        let err = encode_kernel_event(&buf).expect_err("v5 must be rejected");
+        assert!(err.contains("unknown event version"), "got: {err}");
+    }
+}
+
