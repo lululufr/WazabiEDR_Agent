@@ -1,13 +1,14 @@
-//! The `wedr-heartbeat` loop: ping the server, ack commands, sync profile.
+//! The `wedr-heartbeat` loop: ping the server, run + ack commands, sync profile.
 //!
 //! One iteration:
 //! 1. Build a [`HeartbeatRequest`] from the shared [`ProfileState`].
 //! 2. `POST /agents/{id}/heartbeat`.
-//! 3. **Ack** every returned pending command (`status:"completed"` + a
-//!    result stamp). Per the agreed scope this mirrors the reference
-//!    simulator: the agent does **not** actually execute commands — the
-//!    driver is read-only, so kill/isolate aren't possible — it
-//!    acknowledges receipt so the server's queue drains.
+//! 3. For every returned pending command: hand it to
+//!    [`super::executor::execute`] (which may actually perform an action,
+//!    e.g. `TerminateProcess` for `kill_process`, or stay no-op for types
+//!    we can't fulfill in this build), then `POST .../commands/{id}/ack`
+//!    with the resulting status + result. The server's queue drains
+//!    either way; status discriminates "actually ran" vs "ack only".
 //! 4. If the server's `current_profile_version` is ahead of ours, pull the
 //!    new profile (transport only — see [`sync::pull`]).
 //! 5. Sleep `next_checkin_seconds` (server-driven) or the configured
@@ -19,9 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::client::{Client, HeartbeatRequest};
-use super::{ControlStats, ProfileState, responsive_sleep, sync};
+use super::{ControlStats, ProfileState, executor, responsive_sleep, sync};
 use crate::shutdown::SHUTDOWN;
-use crate::util::time::now_iso8601;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -69,16 +69,20 @@ pub fn run(
                     resp.pending_commands.len()
                 );
 
-                // (3) Acknowledge pending commands (receipt only).
+                // (3) Run + ack pending commands. The executor either
+                // performs a real action (kill_process today) or returns
+                // "completed/no-op" with a clear note — either way the
+                // server's PENDING queue drains.
                 for cmd in &resp.pending_commands {
-                    let result = serde_json::json!({
-                        "executed_at": now_iso8601(),
-                        "note": "acknowledged by agent (no local execution in this build)",
-                    });
-                    match client.ack_command(&cmd.id, "completed", result) {
+                    let outcome = executor::execute(cmd);
+                    let final_status = outcome.status;
+                    match client.ack_command(&cmd.id, final_status, outcome.result) {
                         Ok(()) => {
                             stats.bump_command_acked();
-                            eprintln!("[control] acked command {} ({})", cmd.id, cmd.cmd_type);
+                            eprintln!(
+                                "[control] command {} ({}) → ack status={}",
+                                cmd.id, cmd.cmd_type, final_status,
+                            );
                         }
                         Err(e) => {
                             eprintln!("[control] ack command {} failed: {}", cmd.id, e);

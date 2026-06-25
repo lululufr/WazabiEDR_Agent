@@ -90,13 +90,36 @@ struct KernelEnvelope<'a> {
 
 /// Server-shaped subset of `ProcessInfo` that the kernel actually knows
 /// about. Filled by [`extract_process`] from the per-event payloads.
+///
+/// `name` is derived from the basename of `path` — kept cheap because
+/// `kernel_callback` events are high-volume. The SIEM heavily relies on
+/// `process.name` (the keyword field) for Lucene queries like
+/// `process.name:"powershell.exe"`, so providing it here is a big UX win
+/// without going to OpenProcess/PEB territory (which would require a
+/// user-mode handle to the target and synchronous I/O on the hot path).
 #[derive(Serialize)]
 struct ProcessSlim {
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     ppid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
+}
+
+/// Extract a process executable name from a kernel path. Handles both NT
+/// (`\Device\HarddiskVolume3\Windows\System32\notepad.exe`) and DOS
+/// (`C:\Windows\System32\notepad.exe`) variants — the driver may emit
+/// either depending on the callback.
+fn basename(path: &str) -> Option<String> {
+    let idx = path.rfind(|c| c == '\\' || c == '/')?;
+    let name = &path[idx + 1..];
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -124,7 +147,13 @@ fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
-    Some(ProcessSlim { pid, ppid, path })
+    let name = path.as_deref().and_then(basename);
+    Some(ProcessSlim {
+        pid,
+        ppid,
+        name,
+        path,
+    })
 }
 
 /// Decoded form of a kernel event: the server-shaped `event_type` plus
@@ -450,7 +479,15 @@ fn encode_handle_access(buf: &[u8], size: u32) -> Result<serde_json::Value, Stri
         HANDLE_ACCESS_OP_DUPLICATE => "Duplicate",
         _ => "Unknown",
     };
+    // Pour le SIEM, `process.*` représente toujours l'acteur de l'event.
+    // Sur un handle access, l'acteur c'est le SOURCE qui ouvre/duplique
+    // un handle vers la cible — c'est ce qu'on veut détecter (ex: un
+    // process random qui OpenProcess(lsass) = potentiel credential theft).
+    // On duplique src dans `pid` pour que `extract_process` populer
+    // automatiquement le bloc top-level `process` ; `source_pid` reste
+    // dans `raw` pour les requêtes natives.
     Ok(serde_json::json!({
+        "pid": src,
         "source_pid": src,
         "target_pid": dst,
         "desired_access": desired,

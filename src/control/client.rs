@@ -46,11 +46,11 @@ pub struct CommandOut {
     pub id: String,
     #[serde(rename = "type")]
     pub cmd_type: String,
-    /// The command's parameters. Deserialised for wire-completeness but
-    /// not inspected: this build acknowledges receipt without local
-    /// execution (the driver is read-only), so the payload isn't acted on.
+    /// The command's parameters. Read by [`super::executor`] to dispatch
+    /// (e.g. extract `pid` for `kill_process`); types without a local
+    /// executor see this field walk straight back into the ack `result`
+    /// as audit context.
     #[serde(default)]
-    #[allow(dead_code)]
     pub payload: serde_json::Value,
 }
 
