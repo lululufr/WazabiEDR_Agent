@@ -269,7 +269,11 @@ fn supervise_one(initial: PluginManifest, manifest_dir: PathBuf) {
 
     while !SHUTDOWN.load(Ordering::Acquire) {
         // ---- spawn ----
+        // `envs(&current.env)` AVANT le `env(...)` final : on garantit que
+        // `WEDR_PLUGIN_ID` (cf. supervisor protocol) ne peut pas être
+        // écrasé par un env défini dans le manifest.
         let mut child = match Command::new(&current.expected_path)
+            .envs(&current.env)
             .env("WEDR_PLUGIN_ID", &current.plugin_id)
             .spawn()
         {

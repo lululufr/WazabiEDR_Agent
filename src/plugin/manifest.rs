@@ -76,6 +76,14 @@ pub struct PluginManifest {
     /// flag.
     #[serde(default)]
     pub auto_launch: bool,
+
+    /// Environment variables passed to the plugin process at spawn time.
+    /// Populated from the upstream manifest TOML's `runtime.env` table
+    /// at enrolment time. Without this, plugins like the hook injector
+    /// never see `WEDR_HOOK_TARGETS=*` and fall back to their built-in
+    /// default target list.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 /// Errors returned while loading the manifest store.

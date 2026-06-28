@@ -334,6 +334,16 @@ fn download_and_verify(
 
 fn invoke_enroll(bin_path: &Path, info: &PluginInfoForAgent) -> Result<String, String> {
     let bin_str = bin_path.to_string_lossy().into_owned();
+    // `env_pairs` owne les "KEY=VALUE" assemblés à partir du HashMap pour
+    // qu'on puisse leur emprunter des &str en parallèle dans `args`. Sans
+    // ce buffer, on aurait des references vers des `String` temporaires
+    // dont la lifetime n'atteint pas l'invoke_wedr_plugin.
+    let env_pairs: Vec<String> = info
+        .env
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+
     let mut args: Vec<&str> = vec![
         "enroll",
         &bin_str,
@@ -345,6 +355,10 @@ fn invoke_enroll(bin_path: &Path, info: &PluginInfoForAgent) -> Result<String, S
     ];
     if info.auto_launch {
         args.push("--auto-launch");
+    }
+    for kv in &env_pairs {
+        args.push("--env");
+        args.push(kv.as_str());
     }
     let stdout = invoke_wedr_plugin(&args).map_err(|e| format!("wedr-plugin enroll: {e}"))?;
 

@@ -103,6 +103,12 @@ pub struct PluginInfoForAgent {
     pub auto_launch: bool,
     #[serde(default)]
     pub extras: Vec<PluginExtraInfo>,
+    /// Variables d'env déclarées dans `runtime.env` du manifest TOML du
+    /// paquet. Passées à `wedr-plugin enroll --env K=V` puis persistées
+    /// dans le manifest local, le supervisor les pose sur le `Command`
+    /// du plugin au spawn.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
