@@ -42,21 +42,28 @@ pub fn register_pump_handle(handle: HANDLE) {
 
 unsafe extern "system" fn ctrl_handler(ctrl: u32) -> BOOL {
     if ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT {
-        SHUTDOWN.store(true, Ordering::Release);
-        // Wake any thread stuck in a synchronous I/O on the pump
-        // handle (typically DeviceIoControl(IOCTL_WEDR_GET_EVENT)).
-        let raw = DEVICE_HANDLE.load(Ordering::Acquire);
-        if raw != 0 {
-            // SAFETY: FFI. CancelIoEx with overlapped=NULL cancels all
-            // pending I/O for the handle from any thread. Ignoring the
-            // BOOL return: failure (e.g. nothing to cancel) is benign.
-            unsafe { CancelIoEx(raw as HANDLE, core::ptr::null()) };
-        }
+        request();
         // Returning TRUE tells the OS we handled the signal -- without
         // it, the default handler would terminate us before we get a
         // chance to close the device cleanly.
         1
     } else {
         0
+    }
+}
+
+/// Trigger a clean shutdown from anywhere (console Ctrl+C handler,
+/// Windows service STOP control, supervisor giving up). Idempotent.
+///
+/// The combo (atomic flip + `CancelIoEx`) is what unblocks the pump
+/// thread parked inside `DeviceIoControl`; see the file-level docs.
+pub fn request() {
+    SHUTDOWN.store(true, Ordering::Release);
+    let raw = DEVICE_HANDLE.load(Ordering::Acquire);
+    if raw != 0 {
+        // SAFETY: FFI. CancelIoEx with overlapped=NULL cancels all
+        // pending I/O for the handle from any thread. Ignoring the
+        // BOOL return: failure (e.g. nothing to cancel) is benign.
+        unsafe { CancelIoEx(raw as HANDLE, core::ptr::null()) };
     }
 }

@@ -37,6 +37,7 @@ mod filter;
 mod ipc;
 mod plugin;
 mod polling;
+mod service;
 mod shipper;
 mod shutdown;
 mod spool;
@@ -61,7 +62,27 @@ use crate::spool::{SpoolConfig, spawn_writer};
 const PLUGIN_SPOOL_SUBDIR: &str = "plugins";
 
 fn main() -> io::Result<()> {
-    shutdown::install();
+    // Same binary, two roles: real Windows service (production, set up
+    // by the installer's `sc create`) or foreground process (dev). The
+    // service path is tried first; on the canonical "not a service"
+    // error the function transparently calls `run_agent(false)`.
+    service::run()
+}
+
+/// Body of the agent's lifecycle. Called either:
+///   - directly from `main` (console mode, `is_service = false`), or
+///   - from `service::run_service` after the SCM handshake completes
+///     (`is_service = true`).
+///
+/// `is_service` only gates two things: whether to install the Ctrl+C
+/// handler (pointless in a session-0 service with no console) and
+/// whether to short-circuit on unknown CLI args (a service can be
+/// launched with positional arguments from `sc start ARGS…`; treating
+/// them as a help request would refuse to start).
+pub(crate) fn run_agent(is_service: bool) -> io::Result<()> {
+    if !is_service {
+        shutdown::install();
+    }
 
     // Force-exit watchdog. Even with CancelIoEx on the pump handle,
     // a handful of threads can stall in non-cancellable syscalls when
@@ -91,12 +112,12 @@ fn main() -> io::Result<()> {
         })
         .expect("spawn force-exit watchdog");
 
-    // The agent takes no CLI flags. Any argument is treated as a
-    // request for the help message — typing `--help`, `-h`, or just
-    // bumping into the binary with `WazabiEDR_Agent foo` all point
-    // the operator at the config file. Refusing-with-help is friendlier
-    // than refusing-silently.
-    if std::env::args().nth(1).is_some() {
+    // The agent takes no CLI flags in console mode. Any argument is
+    // treated as a request for the help message. Skipped in service
+    // mode because the SCM can pass positional arguments via
+    // `sc start <svc> <arg> ...` that we don't want to refuse — they
+    // would just be ignored here.
+    if !is_service && std::env::args().nth(1).is_some() {
         print_help_and_exit();
     }
 

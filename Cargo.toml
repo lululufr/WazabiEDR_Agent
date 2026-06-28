@@ -53,6 +53,13 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # session_realtime feature only; no kernel logger session needed.
 ferrisetw = "1.2"
 
+# Windows Service Control Manager handshake. Lets the same binary run
+# either as a real Win32 service (StartServiceCtrlDispatcher path) or
+# as a foreground console process (transparent fallback when the
+# dispatcher refuses with ERROR_FAILED_SERVICE_CONTROLLER_CONNECT).
+# Production posture is the service path; dev runs are usually console.
+windows-service = "0.7"
+
 # Smaller, faster, no-debug-info release builds. `panic = "abort"` keeps
 # us in line with the driver's panic policy and removes the unwinding
 # tables; `lto = "thin"` and `codegen-units = 1` give the linker the

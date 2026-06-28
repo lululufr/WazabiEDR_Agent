@@ -1,0 +1,78 @@
+# Release workflow for the WazabiEDR userland agent. Consumed by the
+# installer build (WazabiEDR_Installer) which downloads the matching
+# vX.Y.Z asset from this repo.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Resolve version + asset name
+        id: meta
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $asset   = "wazabi-agent-$version-windows-x86_64.zip"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "asset=$asset"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Stage release contents
+        shell: pwsh
+        run: |
+          $stage = "release-stage"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/WazabiEDR_Agent.exe $stage/
+
+      - name: Compute SHA256SUMS
+        shell: pwsh
+        working-directory: release-stage
+        run: |
+          # Pattern copié du workflow DefenderBridge — énumérer en
+          # premier, hasher en boucle séquentielle, écrire via
+          # Set-Content. @() force le tableau même pour 1 fichier.
+          $entries = @(Get-ChildItem -Path . -File)
+          $lines = foreach ($f in $entries) {
+            $h = (Get-FileHash -Path $f.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($f.Name)"
+          }
+          if (-not $lines) { Write-Error "no files to hash in release-stage"; exit 1 }
+          Set-Content -Path SHA256SUMS -Value $lines -Encoding ascii
+          Get-Content SHA256SUMS
+
+      - name: Zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path release-stage/* -DestinationPath "${{ steps.meta.outputs.asset }}" -Force
+
+      - name: Create release + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.meta.outputs.asset }}
+            release-stage/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true
