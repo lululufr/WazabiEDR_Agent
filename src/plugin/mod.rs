@@ -11,11 +11,13 @@
 //! - [`identity`] — OS-level + integrity + Authenticode verification
 //! - [`server`]   — accept loop, per-session worker, event ingest
 
+pub mod assignment;
 pub mod identity;
 pub mod manifest;
 pub mod protocol;
 pub mod server;
 pub mod supervisor;
 
+pub use assignment::process_pending_plugins;
 pub use server::spawn_server;
 pub use supervisor::spawn_supervisor;

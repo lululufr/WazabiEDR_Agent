@@ -800,9 +800,15 @@ fn emit_event(
         serde_json::Value::from(ev.ts_unix_ns),
     );
     // Stored under `raw` to match the server's `EventIn.raw` field
-    // (and the kernel envelope's `raw`). The plugin chose the shape;
-    // we don't enforce one.
-    obj.insert("raw".into(), ev.payload.clone());
+    // (and the kernel envelope's `raw`). Si le payload contient un
+    // `raw_xml` (cas Defender Event Log, ETW, etc.), on aplatit le bloc
+    // <Data Name="X">VALUE</Data> en champs top-level pour que la console
+    // search puisse les exposer directement sans avoir à parser XML en JS.
+    // Plugin reste libre du shape — on ne fait QU'ENRICHIR, jamais
+    // écraser, et `raw_xml` est conservé pour debug.
+    let mut enriched = ev.payload.clone();
+    enrich_with_xml_data_fields(&mut enriched);
+    obj.insert("raw".into(), enriched);
 
     let mut line = match serde_json::to_vec(&serde_json::Value::Object(obj)) {
         Ok(b) => b,
@@ -841,6 +847,125 @@ fn emit_event(
         };
         engine.process(log);
     }
+}
+
+// =====================================================================
+// XML→JSON enrichment for plugin payloads containing `raw_xml`
+// =====================================================================
+//
+// Si un plugin nous envoie du XML brut (typique des plugins qui pontent
+// vers Windows Event Log via EvtRender — DefenderBridge, futur ETW
+// channels), on aplatit le bloc `<EventData>` en champs typés au niveau
+// du payload. Le plugin n'a rien à faire ; on couvre TOUS les plugins
+// présents et futurs sans imposer de logique XML côté SDK.
+//
+// Format Defender / Event Log standard :
+//   <Event>
+//     <System>
+//       <EventID>1116</EventID>
+//       ...
+//     </System>
+//     <EventData>
+//       <Data Name="Threat Name">Virus:DOS/EICAR_Test_File</Data>
+//       <Data Name="Severity Name">Severe</Data>
+//       ...
+//     </EventData>
+//   </Event>
+//
+// On ne remplace JAMAIS un champ déjà présent dans le payload — si le
+// plugin parse lui-même (cas DefenderBridge v0.1.4+), ses champs ont
+// priorité. `raw_xml` est gardé tel quel pour debug.
+
+/// Enrichit le payload : si `raw_xml` est présent, ajoute `event_id` et
+/// tous les `<Data Name="X">VALUE</Data>` comme champs top-level (en
+/// snake_case). No-op silencieux si pas de `raw_xml`.
+fn enrich_with_xml_data_fields(payload: &mut serde_json::Value) {
+    let Some(obj) = payload.as_object_mut() else { return };
+
+    // Clone parce qu'on doit insert dans obj après — pas possible de
+    // tenir une référence à un de ses champs en même temps.
+    let xml = match obj.get("raw_xml") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => return,
+    };
+
+    // event_id : utile pour search/filter même quand le plugin ne l'a
+    // pas explicitement mis dans son payload.
+    if !obj.contains_key("event_id") {
+        if let Some(id) = scan_event_id(&xml) {
+            obj.insert("event_id".into(), serde_json::Value::from(id));
+        }
+    }
+
+    // Tous les <Data Name="..."> aplatits.
+    for (key, value) in scan_data_fields(&xml) {
+        if !obj.contains_key(&key) {
+            obj.insert(key, serde_json::Value::String(value));
+        }
+    }
+}
+
+/// Locate `<EventID>NNN</EventID>` (or `<EventID Qualifiers="...">NNN</EventID>`).
+fn scan_event_id(xml: &str) -> Option<u32> {
+    let start = xml.find("<EventID")?;
+    let close = xml[start..].find('>')? + start + 1;
+    let end_rel = xml[close..].find("</EventID>")?;
+    xml[close..close + end_rel].trim().parse().ok()
+}
+
+/// Extrait toutes les paires `<Data Name="X">VALUE</Data>` (ou avec
+/// apostrophes `<Data Name='X'>VALUE</Data>` — EvtRender Defender utilise
+/// des apostrophes alors que MOST autres providers utilisent double-quote).
+/// Pattern fixe et stable (schéma `Microsoft-Windows-EventSchema`) — pas
+/// besoin de dépendance XML lourde. HTML entities (`&amp;`, `&lt;`...)
+/// décodées pour que les paths avec `&` apparaissent proprement.
+fn scan_data_fields(xml: &str) -> Vec<(String, String)> {
+    const OPEN_PREFIX: &str = "<Data Name=";
+    const CLOSE: &str = "</Data>";
+    let mut out = Vec::with_capacity(24);
+    let mut rest = xml;
+    while let Some(off) = rest.find(OPEN_PREFIX) {
+        rest = &rest[off + OPEN_PREFIX.len()..];
+        // Détecter le quote utilisé (single ou double) puis le matcher.
+        let Some(quote) = rest.chars().next() else { break };
+        if quote != '"' && quote != '\'' {
+            // Pas un quote reconnu — skip jusqu'à la prochaine occurrence.
+            continue;
+        }
+        rest = &rest[quote.len_utf8()..];
+        let Some(name_end) = rest.find(quote) else { break };
+        let name = &rest[..name_end];
+        rest = &rest[name_end + quote.len_utf8()..];
+        let Some(tag_end) = rest.find('>') else { break };
+        rest = &rest[tag_end + 1..];
+        let Some(val_end) = rest.find(CLOSE) else { break };
+        let value = rest[..val_end].trim();
+        rest = &rest[val_end + CLOSE.len()..];
+        if value.is_empty() {
+            continue;
+        }
+        out.push((normalize_data_key(name), decode_xml_entities(value)));
+    }
+    out
+}
+
+/// "Threat Name" → "threat_name", "FWLink" → "fwlink".
+fn normalize_data_key(name: &str) -> String {
+    name.trim()
+        .chars()
+        .map(|c| if c == ' ' { '_' } else { c.to_ascii_lowercase() })
+        .collect()
+}
+
+fn decode_xml_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 /// Format a `u64` nanoseconds-since-Unix-epoch as `YYYY-MM-DDTHH:MM:SS.mmmZ`.

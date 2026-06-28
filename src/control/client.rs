@@ -63,8 +63,73 @@ pub struct HeartbeatResponse {
     pub current_profile_version: i64,
     #[serde(default)]
     pub pending_commands: Vec<CommandOut>,
+    /// Actions plugin à réconcilier côté agent (install/update/revoke).
+    /// Idempotent : le serveur renvoie la même action tant que l'agent n'a
+    /// pas reporté un status qui la résout.
+    #[serde(default)]
+    pub pending_plugins: Vec<PendingPluginAction>,
     #[serde(default)]
     pub next_checkin_seconds: i64,
+}
+
+/// One plugin action the server wants the agent to apply. Mirror of the
+/// server's `PendingPluginAction` (`WazabiEDR_Server/app/schemas/plugin.py`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PendingPluginAction {
+    pub plugin_package_id: String,
+    pub version: String,
+    /// `"install"` | `"update"` | `"revoke"`.
+    pub action: String,
+    /// UUID retourné par `wedr-plugin enroll` lors d'une install antérieure.
+    /// Présent uniquement pour `action="revoke"` quand le serveur connaît
+    /// la correspondance — sinon l'agent doit faire son propre lookup.
+    #[serde(default)]
+    pub plugin_id_local: Option<String>,
+}
+
+/// Response of `GET /plugins/{id}/info` — what the agent needs to invoke
+/// `wedr-plugin enroll`. The actual manifest is written by `wedr-plugin`
+/// (cf. WazabiEDR_Utils) — the server never produces a PluginManifest JSON.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginInfoForAgent {
+    /// Echo du UUID — l'agent le connaît déjà via le `PendingPluginAction`
+    /// qui a déclenché ce GET. Gardé pour cohérence de contrat ; pas lu.
+    #[allow(dead_code)]
+    pub plugin_package_id: String,
+    pub name: String,
+    pub vendor: String,
+    pub version: String,
+    pub artifact_filename: String,
+    pub auto_launch: bool,
+    #[serde(default)]
+    pub extras: Vec<PluginExtraInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginExtraInfo {
+    pub filename: String,
+    /// Info éditoriale ("library" | "script" | "data"). L'agent traite
+    /// tous les extras de la même façon (drop à côté du binaire principal).
+    #[allow(dead_code)]
+    pub kind: String,
+}
+
+/// Body of `POST /agents/{id}/plugins/{pid}/status` — what the agent reports
+/// after each install/update/revoke transition (and as an hourly sentinel).
+#[derive(Debug, Serialize)]
+pub struct PluginStatusReport<'a> {
+    pub phase: &'a str,
+    pub version: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id_local: Option<&'a str>,
+    pub events_emitted: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event_ts: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_crash_ts: Option<&'a str>,
+    pub crash_count_1h: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<&'a str>,
 }
 
 /// A module the assigned profile requires — subset of the server's
@@ -209,6 +274,111 @@ impl Client {
             .map(|n| n as usize)
             .unwrap_or(alerts.len());
         Ok(received)
+    }
+
+    // ---------------------------------------------------------------
+    // Plugin distribution endpoints (cf. plugin-distribution.md §3)
+    // ---------------------------------------------------------------
+
+    /// `GET /plugins/{id}/info`. `Ok(None)` on 404 (unknown / unassigned).
+    /// `Err` on 409 (package not yet ready — agent should retry next tick).
+    pub fn get_plugin_info(
+        &self,
+        plugin_package_id: &str,
+    ) -> Result<Option<PluginInfoForAgent>, String> {
+        let url = self.url(&format!("/api/v1/plugins/{}/info", plugin_package_id));
+        match self
+            .agent
+            .get(&url)
+            .set("Authorization", &self.bearer())
+            .call()
+        {
+            Ok(resp) => {
+                let text = resp
+                    .into_string()
+                    .map_err(|e| format!("read plugin info: {e}"))?;
+                let info = serde_json::from_str(&text)
+                    .map_err(|e| format!("parse plugin info: {e} — body: {text}"))?;
+                Ok(Some(info))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(stringify_err(e)),
+        }
+    }
+
+    /// `GET /plugins/{id}/binary`. Streams to `dest` and returns the
+    /// expected SHA-256 (from header `X-Plugin-SHA256`) so the caller
+    /// verifies after writing.
+    pub fn download_plugin_binary(
+        &self,
+        plugin_package_id: &str,
+        dest: &std::path::Path,
+    ) -> Result<String, String> {
+        let url = self.url(&format!("/api/v1/plugins/{}/binary", plugin_package_id));
+        self.download_to(&url, dest)
+    }
+
+    /// `GET /plugins/{id}/files/{filename}`. Same contract as the primary
+    /// binary — extras are pushed to disk next to the binary on the agent.
+    pub fn download_plugin_extra(
+        &self,
+        plugin_package_id: &str,
+        filename: &str,
+        dest: &std::path::Path,
+    ) -> Result<String, String> {
+        let url = self.url(&format!(
+            "/api/v1/plugins/{}/files/{}",
+            plugin_package_id, filename
+        ));
+        self.download_to(&url, dest)
+    }
+
+    /// Shared streaming download: writes the body to `dest`, returns the
+    /// SHA-256 declared by the server (header `X-Plugin-SHA256` for the
+    /// primary binary, `X-Plugin-File-SHA256` for extras). Empty string
+    /// if neither header is present (caller treats as "skip verify").
+    fn download_to(&self, url: &str, dest: &std::path::Path) -> Result<String, String> {
+        let resp = self
+            .agent
+            .get(url)
+            .set("Authorization", &self.bearer())
+            .call()
+            .map_err(stringify_err)?;
+        let expected_sha = resp
+            .header("X-Plugin-SHA256")
+            .or_else(|| resp.header("X-Plugin-File-SHA256"))
+            .unwrap_or("")
+            .to_string();
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+        }
+        let mut file = std::fs::File::create(dest)
+            .map_err(|e| format!("create {dest:?}: {e}"))?;
+        std::io::copy(&mut resp.into_reader(), &mut file)
+            .map_err(|e| format!("write {dest:?}: {e}"))?;
+        Ok(expected_sha)
+    }
+
+    /// `POST /agents/{id}/plugins/{pid}/status`. 204 on success.
+    pub fn report_plugin_status(
+        &self,
+        plugin_package_id: &str,
+        report: &PluginStatusReport<'_>,
+    ) -> Result<(), String> {
+        let url = self.url(&format!(
+            "/api/v1/agents/{}/plugins/{}/status",
+            self.creds.agent_id, plugin_package_id
+        ));
+        let bytes = serde_json::to_vec(report)
+            .map_err(|e| format!("serialize plugin status: {e}"))?;
+        self.agent
+            .post(&url)
+            .set("Content-Type", "application/json")
+            .set("Authorization", &self.bearer())
+            .send_bytes(&bytes)
+            .map_err(stringify_err)?;
+        Ok(())
     }
 
     /// `POST /agents/{id}/commands/{cmd_id}/ack`. `result` is embedded

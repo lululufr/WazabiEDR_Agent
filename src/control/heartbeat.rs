@@ -99,6 +99,13 @@ pub fn run(
                     }
                 }
 
+                // (3b) Réconcilier les plugins poussés par le serveur
+                // (install/update/revoke via wedr-plugin). Best-effort :
+                // un échec ici n'arrête pas le heartbeat ni la sync
+                // profil — chaque action produit son propre status report
+                // et le serveur la retentera au prochain tick.
+                crate::plugin::process_pending_plugins(client, &resp.pending_plugins);
+
                 // (4) Profile drift → pull + persist (transport only).
                 let local = {
                     let s = match state.lock() {
