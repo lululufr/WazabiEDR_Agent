@@ -1,8 +1,7 @@
 //! Local executor for server-issued commands.
 //!
-//! The driver is observe-only and we don't ship a FS minifilter / WFP layer
-//! yet — so most "action" command types stay best-effort or no-op. What
-//! lives here today, by type:
+//! The driver is observe-only — actions live in this user-mode executor.
+//! By type:
 //!
 //! - `kill_process`     → real: `TerminateProcess`.
 //! - `quarantine_file`  → real: move the file to `%ProgramData%\WazabiEDR\quarantine\`
@@ -11,20 +10,25 @@
 //! - `scan_now`         → best-effort: enumerates files under `target_path`
 //!                        (or `%ProgramData%`) and returns counts. No
 //!                        signature engine yet.
-//! - `restart_module`   → no-op: the agent has no dynamic module loader.
-//!                        Acks with a clear note so the admin sees it.
-//! - `update_agent`     → no-op: no auto-update channel. Same.
-//! - `update_rules`     → no-op (signal): profile re-pull is handled by the
-//!                        heartbeat loop itself, not here.
-//!
-//! `isolate_endpoint` / `unisolate_endpoint` were removed from the admin
-//! API and UI — without a network layer (WFP or firewall driver) the
-//! command had no real effect, so the buttons were misleading. The enum
-//! values remain in the server's `CommandType` so historical rows still
-//! load, but no executor branch is wired anymore — any new one created
-//! via the `/raw` escape hatch falls into the generic "unknown" arm.
 //! - `run_shell`        → real: `cmd.exe /c <command>`, captured
 //!                        stdout/stderr/exit_code, output capped at 64 KB.
+//! - `isolate_endpoint` → real: pushes `WazabiEDR-Isolate-*` rules to
+//!                        Windows Firewall via `netsh advfirewall`. ALLOW
+//!                        rules win over BLOCK so the server stays
+//!                        reachable. User-mode only — bypassable by a
+//!                        local admin; WFP kernel layer is S6+.
+//! - `unisolate_endpoint` → real: removes the `WazabiEDR-Isolate-*` rules.
+//! - `update_agent`     → real: downloads `download_url`, verifies the
+//!                        optional SHA-256, then launches the InnoSetup
+//!                        bundle with `/SILENT /UPGRADE`. The installer
+//!                        overwrites the binaries and restarts the
+//!                        service without re-enrolling.
+//! - `update_rules`     → ack-only here: the actual re-pull is done by
+//!                        the heartbeat loop, which sees the pending
+//!                        command and forces a `sync::pull()` even if the
+//!                        server-side version hasn't moved.
+//! - `restart_module`   → no-op: the agent has no dynamic module loader.
+//!                        Acks with a clear note so the admin sees it.
 //!
 //! Every executor returns an [`ExecutionResult`] that the heartbeat loop
 //! pushes back via `POST .../commands/{id}/ack`. The `status` field
@@ -57,9 +61,14 @@ pub fn execute(cmd: &CommandOut) -> ExecutionResult {
         "quarantine_file" => execute_quarantine_file(&cmd.payload),
         "scan_now" => execute_scan_now(&cmd.payload),
         "run_shell" => execute_run_shell(&cmd.payload),
+        "isolate_endpoint" => execute_isolate(&cmd.payload),
+        "unisolate_endpoint" => execute_unisolate(),
+        "update_agent" => execute_update_agent(&cmd.payload),
+        "update_rules" => no_op_ack(
+            "re-pull triggered by heartbeat loop (sees this pending cmd and forces sync::pull)",
+            &cmd.payload,
+        ),
         "restart_module" => no_op_ack("no dynamic module loader — restart_module is a stub", &cmd.payload),
-        "update_agent" => no_op_ack("no auto-update channel — update_agent is a stub", &cmd.payload),
-        "update_rules" => no_op_ack("re-pull handled by heartbeat loop, not executor", &cmd.payload),
         other => ExecutionResult {
             status: "completed",
             result: serde_json::json!({
@@ -531,6 +540,313 @@ fn walk(
         }
     }
     false
+}
+
+// ===========================================================================
+// isolate_endpoint / unisolate_endpoint — Windows Firewall via netsh
+// ===========================================================================
+
+/// Préfixe stable de toutes les règles que cet exécuteur installe — sert
+/// d'amorce pour retirer l'isolation en bloc en `unisolate`.
+const ISOLATE_RULE_PREFIX: &str = "WazabiEDR-Isolate";
+
+fn execute_isolate(payload: &serde_json::Value) -> ExecutionResult {
+    let allowed_hosts: Vec<String> = payload
+        .get("allowed_hosts")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // On résout chaque host en IP ici, AVANT de poser les règles BLOCK —
+    // une fois isolés, gethostbyname ne pourra plus joindre le DNS. La
+    // résolution échouera silencieusement pour les hosts injoignables,
+    // qu'on signale dans le résultat.
+    let mut allowed_ips: Vec<String> = Vec::new();
+    let mut unresolved: Vec<String> = Vec::new();
+    for host in &allowed_hosts {
+        match resolve_host_to_ipv4(host) {
+            Some(ip) => allowed_ips.push(ip),
+            None => unresolved.push(host.clone()),
+        }
+    }
+
+    // Retire d'abord d'éventuelles règles d'une isolation précédente —
+    // évite de cumuler des exceptions périmées.
+    let _ = delete_isolate_rules();
+
+    // Block rules (in + out). Sans elles, ALLOW seul ne suffit pas car
+    // Windows autoriserait tout le reste par défaut.
+    let mut actions: Vec<serde_json::Value> = Vec::new();
+    actions.push(run_netsh_add_block("OutBlock", "out"));
+    actions.push(run_netsh_add_block("InBlock", "in"));
+
+    // Allow rules — une par direction, une par IP whitelistée.
+    // remoteip= peut prendre une liste séparée par virgules ; on l'utilise
+    // pour ne créer que 2 règles ALLOW (in + out) même avec N hosts.
+    if !allowed_ips.is_empty() {
+        let csv = allowed_ips.join(",");
+        actions.push(run_netsh_add_allow("AllowOut", "out", &csv));
+        actions.push(run_netsh_add_allow("AllowIn", "in", &csv));
+    }
+
+    let all_ok = actions
+        .iter()
+        .all(|a| a.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+
+    ExecutionResult {
+        status: if all_ok { "success" } else { "failed" },
+        result: serde_json::json!({
+            "executed_at": now_iso8601(),
+            "action": "isolate_endpoint",
+            "allowed_hosts": allowed_hosts,
+            "allowed_ips": allowed_ips,
+            "unresolved_hosts": unresolved,
+            "netsh_actions": actions,
+            "reason": payload.get("reason"),
+        }),
+    }
+}
+
+fn execute_unisolate() -> ExecutionResult {
+    let deleted = delete_isolate_rules();
+    let any_failed = deleted
+        .iter()
+        .any(|d| !d.get("ok").and_then(|v| v.as_bool()).unwrap_or(true));
+    ExecutionResult {
+        // On reste sur "success" même si certaines delete renvoient 1 — c'est
+        // typiquement parce que la règle n'existait pas (pas isolé au préalable).
+        // L'admin lit `netsh_actions` pour voir le détail.
+        status: if any_failed { "completed" } else { "success" },
+        result: serde_json::json!({
+            "executed_at": now_iso8601(),
+            "action": "unisolate_endpoint",
+            "netsh_actions": deleted,
+        }),
+    }
+}
+
+fn run_netsh_add_block(suffix: &str, dir: &str) -> serde_json::Value {
+    let name = format!("{}-{}", ISOLATE_RULE_PREFIX, suffix);
+    netsh_invoke(&[
+        "advfirewall", "firewall", "add", "rule",
+        &format!("name={}", name),
+        &format!("dir={}", dir),
+        "action=block",
+        "enable=yes",
+        "profile=any",
+    ])
+}
+
+fn run_netsh_add_allow(suffix: &str, dir: &str, remote_ip_csv: &str) -> serde_json::Value {
+    let name = format!("{}-{}", ISOLATE_RULE_PREFIX, suffix);
+    netsh_invoke(&[
+        "advfirewall", "firewall", "add", "rule",
+        &format!("name={}", name),
+        &format!("dir={}", dir),
+        "action=allow",
+        "enable=yes",
+        "profile=any",
+        &format!("remoteip={}", remote_ip_csv),
+    ])
+}
+
+/// Tente de supprimer les 4 règles standard. `netsh delete rule name=X`
+/// renvoie un exit code non-zero quand la règle n'existe pas — c'est OK
+/// en unisolate (l'agent n'était peut-être pas isolé). On rapporte chaque
+/// action individuellement pour que l'admin voie l'état réel.
+fn delete_isolate_rules() -> Vec<serde_json::Value> {
+    ["OutBlock", "InBlock", "AllowOut", "AllowIn"]
+        .iter()
+        .map(|suffix| {
+            let name = format!("{}-{}", ISOLATE_RULE_PREFIX, suffix);
+            netsh_invoke(&[
+                "advfirewall", "firewall", "delete", "rule",
+                &format!("name={}", name),
+            ])
+        })
+        .collect()
+}
+
+fn netsh_invoke(args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new("netsh");
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    match cmd.output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let code = out.status.code();
+            serde_json::json!({
+                "ok": out.status.success(),
+                "exit_code": code,
+                "args": args,
+                "stdout": stdout.trim(),
+                "stderr": stderr.trim(),
+            })
+        }
+        Err(e) => serde_json::json!({
+            "ok": false,
+            "exit_code": serde_json::Value::Null,
+            "args": args,
+            "error": format!("spawn netsh failed: {e}"),
+        }),
+    }
+}
+
+/// Résolution best-effort host → IPv4. Si `host` est déjà une IP, le
+/// renvoie tel quel. Sinon, fait un `ToSocketAddrs` sur (host, 0) et
+/// prend la première IPv4. Renvoie None si rien ne résout.
+fn resolve_host_to_ipv4(host: &str) -> Option<String> {
+    use std::net::{IpAddr, ToSocketAddrs};
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Some(ip.to_string());
+    }
+    let with_port = format!("{}:0", host);
+    let addrs = with_port.to_socket_addrs().ok()?;
+    for sa in addrs {
+        if let IpAddr::V4(v4) = sa.ip() {
+            return Some(v4.to_string());
+        }
+    }
+    None
+}
+
+// ===========================================================================
+// update_agent — download bundle + verify sha256 + launch InnoSetup /SILENT /UPGRADE
+// ===========================================================================
+
+fn execute_update_agent(payload: &serde_json::Value) -> ExecutionResult {
+    let download_url = match payload.get("download_url").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return ExecutionResult {
+                status: "failed",
+                result: serde_json::json!({
+                    "error": "missing 'download_url' — server must inject INSTALLER_URL",
+                    "got": payload,
+                }),
+            };
+        }
+    };
+    let expected_sha = payload.get("sha256").and_then(|v| v.as_str()).map(str::to_string);
+    let target_version = payload.get("target_version").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Téléchargement dans %TEMP% — l'installeur InnoSetup s'extrait
+    // ailleurs, donc on n'a pas à rester long ici.
+    let tmp_dir = std::env::temp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let installer_path = tmp_dir.join(format!("WazabiEDR_Setup_{}.exe", stamp));
+
+    let download = match download_to_file(&download_url, &installer_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return ExecutionResult {
+                status: "failed",
+                result: serde_json::json!({
+                    "error": format!("download failed: {e}"),
+                    "url": download_url,
+                }),
+            };
+        }
+    };
+
+    // SHA-256 — refus dur si fourni et non-matché. Sans hash, on logue
+    // celui calculé pour traçabilité mais on continue.
+    let actual_sha = match sha256_file(&installer_path) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = fs::remove_file(&installer_path);
+            return ExecutionResult {
+                status: "failed",
+                result: serde_json::json!({
+                    "error": format!("sha256 failed: {e}"),
+                    "installer_path": installer_path.display().to_string(),
+                }),
+            };
+        }
+    };
+    if let Some(want) = &expected_sha {
+        if !want.eq_ignore_ascii_case(&actual_sha) {
+            let _ = fs::remove_file(&installer_path);
+            return ExecutionResult {
+                status: "failed",
+                result: serde_json::json!({
+                    "error": "sha256 mismatch — refusing to install",
+                    "expected": want,
+                    "actual": actual_sha,
+                    "installer_path": installer_path.display().to_string(),
+                }),
+            };
+        }
+    }
+
+    // Lancement détaché : on doit pouvoir ack la commande AVANT que
+    // l'installeur stoppe notre service. Donc on ne `wait()` pas — on
+    // spawn et on rend la main.
+    let spawn_result = Command::new(&installer_path)
+        .args(["/SILENT", "/UPGRADE", "/SUPPRESSMSGBOXES"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let pid = match spawn_result {
+        Ok(child) => child.id(),
+        Err(e) => {
+            return ExecutionResult {
+                status: "failed",
+                result: serde_json::json!({
+                    "error": format!("spawn installer failed: {e}"),
+                    "installer_path": installer_path.display().to_string(),
+                    "downloaded_bytes": download,
+                    "actual_sha256": actual_sha,
+                }),
+            };
+        }
+    };
+
+    ExecutionResult {
+        status: "success",
+        result: serde_json::json!({
+            "executed_at": now_iso8601(),
+            "action": "update_agent",
+            "target_version": target_version,
+            "download_url": download_url,
+            "downloaded_bytes": download,
+            "sha256_verified": expected_sha.is_some(),
+            "sha256": actual_sha,
+            "installer_path": installer_path.display().to_string(),
+            "installer_pid": pid,
+            "note": "installer spawned with /SILENT /UPGRADE — service will restart from new binaries",
+        }),
+    }
+}
+
+/// Télécharge un URL HTTPS vers un fichier local via ureq (déjà au
+/// classpath du shipper). Renvoie le nombre d'octets écrits.
+fn download_to_file(url: &str, dst: &Path) -> Result<u64, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build();
+    let resp = agent.get(url).call().map_err(|e| e.to_string())?;
+    if resp.status() / 100 != 2 {
+        return Err(format!("HTTP {} {}", resp.status(), resp.status_text()));
+    }
+    let mut reader = resp.into_reader();
+    let mut file = fs::File::create(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
+    let written = std::io::copy(&mut reader, &mut file).map_err(|e| e.to_string())?;
+    Ok(written)
 }
 
 // ===========================================================================
