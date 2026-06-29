@@ -111,14 +111,29 @@ struct ProcessSlim {
     /// for events that don't carry one.
     #[serde(skip_serializing_if = "Option::is_none")]
     command_line: Option<String>,
-    /// Server's `ProcessInfo.user`. We ship the **SDDL SID** (e.g.
-    /// `S-1-5-21-…-1001`) rather than `DOMAIN\user` because resolving in
-    /// the kernel callback would require either an LSA lookup (paged,
-    /// can recurse into network for domain SIDs) or a user-mode cache
-    /// (extra dependency on each event). The server / SIEM is the right
-    /// place to do that resolution lazily.
+    /// Nom du compte (résolu user-mode via LookupAccountSid). Fallback sur
+    /// le SID brut quand la résolution échoue — comme ça `process.user`
+    /// n'est jamais vide quand le kernel a fourni un SID.
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<String>,
+    /// SID brut (SDDL, ex. `S-1-5-21-…-1001`) — toujours présent quand le
+    /// kernel a résolu le token. Permet de pivoter même si le nom change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_sid: Option<String>,
+    /// Domaine du compte (`NT AUTHORITY`, `BUILTIN`, `<NETBIOS>`).
+    /// Présent seulement si la résolution SID a réussi.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_domain: Option<String>,
+    /// Label lisible du token integrity (low / medium / high / system).
+    /// Sentinelle 0xFFFFFFFF côté kernel = champ absent ici.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integrity_label: Option<String>,
+    /// Session Windows : 0 = service / Session 0, >=1 = sessions interactives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: Option<u32>,
+    /// `true` si le token est élevé (UAC consenti ou session admin sans UAC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elevated: Option<bool>,
 }
 
 /// Extract a process executable name from a kernel path. Handles both NT
@@ -166,11 +181,35 @@ fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
-    let user = payload
+    let user_sid = payload
         .get("user_sid")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_owned());
+    // `process.user` côté serveur = nom lisible. Si la résolution n'a pas
+    // marché, on retombe sur le SID brut pour ne JAMAIS avoir un
+    // `process.user` vide quand le kernel a fourni un user_sid.
+    let user_full = payload
+        .get("user_full")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let user = user_full.or_else(|| user_sid.clone());
+    let user_domain = payload
+        .get("user_domain")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let integrity_label = payload
+        .get("integrity_label")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned());
+    let session_id = payload
+        .get("session_id")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
+    let elevated = payload.get("elevated").and_then(|v| v.as_bool());
     Some(ProcessSlim {
         pid,
         ppid,
@@ -178,6 +217,11 @@ fn extract_process(payload: &serde_json::Value) -> Option<ProcessSlim> {
         path,
         command_line,
         user,
+        user_sid,
+        user_domain,
+        integrity_label,
+        session_id,
+        elevated,
     })
 }
 
@@ -412,7 +456,23 @@ fn encode_process_create(buf: &[u8], size: u32) -> Result<serde_json::Value, Str
         obj.insert("parent_image_name".into(), parent_image_name.into());
     }
     if !user_sid.is_empty() {
-        obj.insert("user_sid".into(), user_sid.into());
+        obj.insert("user_sid".into(), user_sid.clone().into());
+        // user_sid résolu en (account, domain) — c'est ce qui apparaît
+        // sous `process.user` dans la console. Best-effort : si le SID
+        // n'est pas résoluble (compte supprimé, SID d'un autre forest),
+        // on garde juste user_sid.
+        if let Some((account, domain)) = crate::enrich::resolve_user(&user_sid) {
+            obj.insert("user".into(), account.clone().into());
+            obj.insert("user_domain".into(), domain.clone().into());
+            // Forme combinée DOMAIN\user, plus pratique pour grep en
+            // SIEM ("user_full:NT AUTHORITY\\SYSTEM").
+            let full = if domain.is_empty() {
+                account
+            } else {
+                format!("{}\\{}", domain, account)
+            };
+            obj.insert("user_full".into(), full.into());
+        }
     }
     // Integrity level: skip the 0xFFFFFFFF sentinel so the field isn't
     // indexed for events where the kernel couldn't resolve it. Otherwise
@@ -425,6 +485,17 @@ fn encode_process_create(buf: &[u8], size: u32) -> Result<serde_json::Value, Str
             "integrity_label".into(),
             integrity_label_str(il).into(),
         );
+    }
+    // Session Windows (0 = service / Session 0, >=1 = sessions
+    // interactives). Lookup via OpenProcess sur le PID — best-effort,
+    // car le process peut avoir déjà exit avant qu'on le query.
+    if let Some(sid) = crate::enrich::session_id_for_pid(pid) {
+        obj.insert("session_id".into(), sid.into());
+    }
+    // Token élévé (UAC) — utile en triage : un cmd.exe élevé n'a pas la
+    // même surface qu'un cmd.exe utilisateur.
+    if let Some(elev) = crate::enrich::is_elevated_for_pid(pid) {
+        obj.insert("elevated".into(), elev.into());
     }
     Ok(payload)
 }

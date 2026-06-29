@@ -32,6 +32,7 @@
 mod config;
 mod control;
 mod detection;
+mod enrich;
 mod etw;
 mod filter;
 mod ipc;
