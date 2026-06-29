@@ -545,10 +545,39 @@ fn walk(
 // ===========================================================================
 // isolate_endpoint / unisolate_endpoint — Windows Firewall via netsh
 // ===========================================================================
+//
+// Pourquoi pas juste "add rule action=block" :
+//
+// Windows Firewall a un stock de centaines d'allow rules par defaut (svchost,
+// WinHTTP, ICMP, mDNS, etc.). Ajouter quelques block rules NE LES OVERRIDE
+// PAS — les allow continuent a laisser passer leur trafic. Et meme avec
+// `set firewallpolicy blockoutbound`, la policy DEFAULT ne s'applique
+// qu'aux flux qui ne matchent AUCUNE rule existante. Resultat : la machine
+// continue de parler a internet via les allow rules built-in.
+//
+// La seule maniere fiable avec netsh seul (sans WFP kernel) est :
+//
+//   1. Export l'etat firewall complet vers un .wfw (backup).
+//   2. `netsh advfirewall reset` — vide toutes les rules existantes.
+//   3. `set allprofiles state on` + `firewallpolicy blockinbound,blockoutbound`
+//      — plus aucune allow ne laisse passer, et la policy default block tout.
+//   4. Ajouter NOS allow rules : serveur Wazabi + loopback.
+//   5. Unisolate = `netsh advfirewall import <backup.wfw>` — restore
+//      EXACTEMENT l'etat d'avant (rules, profils, IPSec, tout).
 
-/// Préfixe stable de toutes les règles que cet exécuteur installe — sert
-/// d'amorce pour retirer l'isolation en bloc en `unisolate`.
 const ISOLATE_RULE_PREFIX: &str = "WazabiEDR-Isolate";
+
+/// Le backup binaire du firewall. Persiste dans %ProgramData% pour
+/// survivre a un reboot de l'agent pendant l'isolation. Si le fichier
+/// existe deja a l'execution d'isolate, on ne l'ecrase PAS (re-isolate
+/// idempotent — l'etat de reference reste celui d'avant la 1ere
+/// isolation).
+fn isolation_backup_path() -> PathBuf {
+    let pd = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    pd.join("WazabiEDR").join("firewall_pre_isolation.wfw")
+}
 
 fn execute_isolate(payload: &serde_json::Value) -> ExecutionResult {
     let allowed_hosts: Vec<String> = payload
@@ -562,10 +591,7 @@ fn execute_isolate(payload: &serde_json::Value) -> ExecutionResult {
         })
         .unwrap_or_default();
 
-    // On résout chaque host en IP ici, AVANT de poser les règles BLOCK —
-    // une fois isolés, gethostbyname ne pourra plus joindre le DNS. La
-    // résolution échouera silencieusement pour les hosts injoignables,
-    // qu'on signale dans le résultat.
+    // Resolution DNS AVANT le reset firewall — sinon plus de DNS apres.
     let mut allowed_ips: Vec<String> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
     for host in &allowed_hosts {
@@ -575,28 +601,78 @@ fn execute_isolate(payload: &serde_json::Value) -> ExecutionResult {
         }
     }
 
-    // Retire d'abord d'éventuelles règles d'une isolation précédente —
-    // évite de cumuler des exceptions périmées.
-    let _ = delete_isolate_rules();
-
-    // Block rules (in + out). Sans elles, ALLOW seul ne suffit pas car
-    // Windows autoriserait tout le reste par défaut.
     let mut actions: Vec<serde_json::Value> = Vec::new();
-    actions.push(run_netsh_add_block("OutBlock", "out"));
-    actions.push(run_netsh_add_block("InBlock", "in"));
 
-    // Allow rules — une par direction, une par IP whitelistée.
-    // remoteip= peut prendre une liste séparée par virgules ; on l'utilise
-    // pour ne créer que 2 règles ALLOW (in + out) même avec N hosts.
-    if !allowed_ips.is_empty() {
-        let csv = allowed_ips.join(",");
-        actions.push(run_netsh_add_allow("AllowOut", "out", &csv));
-        actions.push(run_netsh_add_allow("AllowIn", "in", &csv));
+    // 1) Backup. Si deja present, on respecte (re-isolate ne doit pas
+    // ecraser le backup de la 1ere isolation).
+    let backup_path = isolation_backup_path();
+    let backup_str = backup_path.display().to_string();
+    if !backup_path.exists() {
+        if let Some(parent) = backup_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        actions.push(serde_json::json!({"step": "backup", "path": backup_str}));
+        actions.push(netsh_invoke(&["advfirewall", "export", &backup_str]));
+    } else {
+        actions.push(serde_json::json!({
+            "step": "backup_skipped",
+            "reason": "backup already present from a previous isolate",
+            "path": backup_str,
+        }));
     }
 
-    let all_ok = actions
-        .iter()
-        .all(|a| a.get("ok").and_then(|v| v.as_bool()).unwrap_or(false));
+    // 2) Reset des rules existantes (les allow built-in disparaissent).
+    actions.push(serde_json::json!({"step": "reset"}));
+    actions.push(netsh_invoke(&["advfirewall", "reset"]));
+
+    // 3) Firewall ON + policy block in + out par defaut.
+    actions.push(serde_json::json!({"step": "enable_firewall"}));
+    actions.push(netsh_invoke(&["advfirewall", "set", "allprofiles", "state", "on"]));
+    actions.push(serde_json::json!({"step": "set_policy_block_all"}));
+    actions.push(netsh_invoke(&[
+        "advfirewall", "set", "allprofiles",
+        "firewallpolicy", "blockinbound,blockoutbound",
+    ]));
+
+    // 4) Allow rules : loopback (ne pas casser les apps locales).
+    actions.push(serde_json::json!({"step": "allow_loopback"}));
+    actions.push(run_netsh_add_allow("LoopOut", "out", "127.0.0.1,::1"));
+    actions.push(run_netsh_add_allow("LoopIn", "in", "127.0.0.1,::1"));
+
+    // 5) Allow rules : serveur Wazabi + autres hosts whitelistes.
+    if !allowed_ips.is_empty() {
+        let csv = allowed_ips.join(",");
+        actions.push(run_netsh_add_allow("ServerOut", "out", &csv));
+        actions.push(run_netsh_add_allow("ServerIn", "in", &csv));
+    }
+
+    // 6) DHCP/DHCPv6 — sans ca, le bail expire et l'IP change/disparait.
+    // Bloquer DHCP isole bien... jusqu'au prochain renew, ou la machine
+    // perd son adresse et plus rien ne marche y compris l'unisolate.
+    actions.push(serde_json::json!({"step": "allow_dhcp"}));
+    actions.push(netsh_invoke(&[
+        "advfirewall", "firewall", "add", "rule",
+        &format!("name={}-DHCP-Out", ISOLATE_RULE_PREFIX),
+        "dir=out", "action=allow", "enable=yes", "profile=any",
+        "protocol=udp", "localport=68,546", "remoteport=67,547",
+    ]));
+    actions.push(netsh_invoke(&[
+        "advfirewall", "firewall", "add", "rule",
+        &format!("name={}-DHCP-In", ISOLATE_RULE_PREFIX),
+        "dir=in", "action=allow", "enable=yes", "profile=any",
+        "protocol=udp", "localport=68,546", "remoteport=67,547",
+    ]));
+
+    // On considere "success" si TOUTES les commandes netsh ont ok=true.
+    // Les marqueurs {step: ...} sans champ `ok` sont ignores (vrais
+    // marqueurs de phase, pas des invocations).
+    let all_ok = actions.iter().all(|a| {
+        // Si pas de champ "ok" → c'est un marqueur de phase, on ignore.
+        a.get("ok")
+            .and_then(|v| v.as_bool())
+            .map(|b| b)
+            .unwrap_or(true)
+    });
 
     ExecutionResult {
         status: if all_ok { "success" } else { "failed" },
@@ -606,6 +682,7 @@ fn execute_isolate(payload: &serde_json::Value) -> ExecutionResult {
             "allowed_hosts": allowed_hosts,
             "allowed_ips": allowed_ips,
             "unresolved_hosts": unresolved,
+            "backup_path": backup_str,
             "netsh_actions": actions,
             "reason": payload.get("reason"),
         }),
@@ -613,33 +690,56 @@ fn execute_isolate(payload: &serde_json::Value) -> ExecutionResult {
 }
 
 fn execute_unisolate() -> ExecutionResult {
-    let deleted = delete_isolate_rules();
-    let any_failed = deleted
+    let mut actions: Vec<serde_json::Value> = Vec::new();
+    let backup_path = isolation_backup_path();
+    let backup_str = backup_path.display().to_string();
+
+    if backup_path.exists() {
+        // Cas nominal : restore EXACTEMENT l'etat firewall pre-isolation
+        // (rules, profils, IPSec, policy default). `import` ecrase tout.
+        actions.push(serde_json::json!({"step": "import_backup", "path": backup_str}));
+        actions.push(netsh_invoke(&["advfirewall", "import", &backup_str]));
+        // Cleanup du fichier — la prochaine isolation refera un backup
+        // a partir de l'etat courant.
+        match std::fs::remove_file(&backup_path) {
+            Ok(_) => actions.push(serde_json::json!({"step": "backup_removed"})),
+            Err(e) => actions.push(serde_json::json!({
+                "step": "backup_remove_failed",
+                "error": e.to_string(),
+            })),
+        }
+    } else {
+        // Mode degrade : pas de backup. Reset les rules existantes (qui
+        // incluent peut-etre des WazabiEDR-Isolate-* d'un ancien run) et
+        // remet la policy a la valeur Windows par defaut. Mieux que
+        // laisser blockoutbound en place.
+        actions.push(serde_json::json!({
+            "step": "no_backup_fallback_reset",
+            "note": "no isolation backup found at {} — performing a firewall reset",
+        }));
+        actions.push(netsh_invoke(&["advfirewall", "reset"]));
+        actions.push(netsh_invoke(&[
+            "advfirewall", "set", "allprofiles", "state", "on",
+        ]));
+        actions.push(netsh_invoke(&[
+            "advfirewall", "set", "allprofiles",
+            "firewallpolicy", "blockinbound,allowoutbound",
+        ]));
+    }
+
+    let all_ok = actions
         .iter()
-        .any(|d| !d.get("ok").and_then(|v| v.as_bool()).unwrap_or(true));
+        .all(|a| a.get("ok").and_then(|v| v.as_bool()).unwrap_or(true));
+
     ExecutionResult {
-        // On reste sur "success" même si certaines delete renvoient 1 — c'est
-        // typiquement parce que la règle n'existait pas (pas isolé au préalable).
-        // L'admin lit `netsh_actions` pour voir le détail.
-        status: if any_failed { "completed" } else { "success" },
+        status: if all_ok { "success" } else { "completed" },
         result: serde_json::json!({
             "executed_at": now_iso8601(),
             "action": "unisolate_endpoint",
-            "netsh_actions": deleted,
+            "backup_path": backup_str,
+            "netsh_actions": actions,
         }),
     }
-}
-
-fn run_netsh_add_block(suffix: &str, dir: &str) -> serde_json::Value {
-    let name = format!("{}-{}", ISOLATE_RULE_PREFIX, suffix);
-    netsh_invoke(&[
-        "advfirewall", "firewall", "add", "rule",
-        &format!("name={}", name),
-        &format!("dir={}", dir),
-        "action=block",
-        "enable=yes",
-        "profile=any",
-    ])
 }
 
 fn run_netsh_add_allow(suffix: &str, dir: &str, remote_ip_csv: &str) -> serde_json::Value {
@@ -653,23 +753,6 @@ fn run_netsh_add_allow(suffix: &str, dir: &str, remote_ip_csv: &str) -> serde_js
         "profile=any",
         &format!("remoteip={}", remote_ip_csv),
     ])
-}
-
-/// Tente de supprimer les 4 règles standard. `netsh delete rule name=X`
-/// renvoie un exit code non-zero quand la règle n'existe pas — c'est OK
-/// en unisolate (l'agent n'était peut-être pas isolé). On rapporte chaque
-/// action individuellement pour que l'admin voie l'état réel.
-fn delete_isolate_rules() -> Vec<serde_json::Value> {
-    ["OutBlock", "InBlock", "AllowOut", "AllowIn"]
-        .iter()
-        .map(|suffix| {
-            let name = format!("{}-{}", ISOLATE_RULE_PREFIX, suffix);
-            netsh_invoke(&[
-                "advfirewall", "firewall", "delete", "rule",
-                &format!("name={}", name),
-            ])
-        })
-        .collect()
 }
 
 fn netsh_invoke(args: &[&str]) -> serde_json::Value {
