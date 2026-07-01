@@ -319,11 +319,20 @@ pub(crate) fn run_agent(is_service: bool) -> io::Result<()> {
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| PathBuf::from("."));
+            // Apply server-pushed rules to the local engine when both are
+            // wired. When detection is disabled, `engine` is None and the
+            // sync persists the template JSON without applying it.
+            let remote_rules_path = cfg
+                .detection
+                .as_ref()
+                .and_then(|d| d.server_rules_path.clone());
             let ctrl_cfg = control::ControlConfig {
                 creds,
                 heartbeat_interval: cc.heartbeat_interval,
                 send_alerts: cc.send_alerts,
                 state_dir,
+                remote_rules_path,
+                engine: detection.clone(),
             };
             match control::spawn_control(ctrl_cfg, alert_rx) {
                 Ok(h) => Some(h),

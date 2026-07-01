@@ -102,6 +102,16 @@ pub struct DetectionConfig {
     /// Path to the root `.waza` rules file. `include` directives inside
     /// it are resolved relative to this file.
     pub rules_path: PathBuf,
+    /// Path où les règles poussées par le serveur (template du profil
+    /// assigné) sont concaténées et écrites. `None` ⇒ on persiste juste
+    /// le template JSON pour audit mais on n'applique rien.
+    ///
+    /// Pour que ces règles soient effectivement appliquées, le fichier
+    /// désigné par `rules_path` doit contenir `include "./server.waza"`
+    /// (ou le chemin relatif équivalent). Sinon le reload qui suit
+    /// l'écriture est inoffensif — il recharge ce que le user a
+    /// localement, point.
+    pub server_rules_path: Option<PathBuf>,
     /// Optional JSON schema file used only to validate rule field paths
     /// at load time (warns on likely typos). `None` ⇒ validation skipped.
     pub schema_path: Option<PathBuf>,
@@ -115,6 +125,10 @@ impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
             rules_path: default_rules_path(),
+            // Par défaut on écrit à côté du rules_path principal. L'opérateur
+            // peut soit pointer son rules.waza dessus, soit l'inclure
+            // explicitement, soit désactiver via `null` côté config.
+            server_rules_path: Some(default_server_rules_path()),
             schema_path: None,
             default_window: Duration::from_secs(5),
             reload_interval: Duration::from_secs(5),
@@ -229,6 +243,10 @@ struct DetectionSection {
     enabled: Option<bool>,
     #[serde(default)]
     rules_path: Option<String>,
+    /// Empty string ⇒ désactivé (le serveur ne pousse rien d'appliqué).
+    /// Absent ⇒ default `<ProgramData>/WazabiEDR/rules/server.waza`.
+    #[serde(default)]
+    server_rules_path: Option<String>,
     #[serde(default)]
     schema_path: Option<String>,
     #[serde(default)]
@@ -276,6 +294,13 @@ fn default_rules_path() -> PathBuf {
     base.join("WazabiEDR").join("rules").join("main.waza")
 }
 
+fn default_server_rules_path() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"));
+    base.join("WazabiEDR").join("rules").join("server.waza")
+}
+
 impl AppConfig {
     /// Load and resolve the full configuration.
     ///
@@ -313,8 +338,13 @@ impl AppConfig {
             Err(e) => return Err(format!("read {:?}: {}", path, e)),
         };
 
-        let parsed: ConfigFile =
+        let mut parsed: ConfigFile =
             serde_json::from_slice(&bytes).map_err(|e| format!("parse {:?}: {}", path, e))?;
+
+        // Charge les overrides poussés par le serveur (whitelist stricte
+        // côté serveur, appliqués ici). Best-effort : si le fichier est
+        // corrompu, on continue avec la config locale seule.
+        merge_server_overrides(&mut parsed, path);
 
         let agent = resolve_agent(parsed.agent.unwrap_or_default());
         let shipper = match parsed.shipper {
@@ -326,8 +356,12 @@ impl AppConfig {
             }
             _ => None,
         };
+        // `enabled` absent = considéré actif : la détection est un pilier
+        // du produit, on ne veut pas qu'une config héritée sans le champ
+        // la garde silencieusement off. Il faut mettre `false` explicite
+        // pour la désactiver.
         let detection = match parsed.detection {
-            Some(d) if d.enabled.unwrap_or(false) => Some(resolve_detection(d)),
+            Some(d) if d.enabled.unwrap_or(true) => Some(resolve_detection(d)),
             _ => None,
         };
         let control = match parsed.control {
@@ -352,6 +386,103 @@ impl AppConfig {
             etw,
             polling,
         })
+    }
+}
+
+/// Overrides poussés par le serveur, désérialisés depuis
+/// `<state_dir>/agent_config_overrides.json` (le state_dir = parent
+/// d'`agent.json`). Champs optionnels : un `None` = pas d'override.
+/// La structure miroir de `AgentConfigOverrides` (Pydantic serveur) —
+/// tout ajout côté serveur doit être répliqué ici sinon le champ
+/// est silencieusement ignoré.
+#[derive(Debug, Deserialize, Default)]
+struct AgentConfigOverrides {
+    // control
+    heartbeat_interval_secs: Option<u64>,
+    send_alerts: Option<bool>,
+    // detection
+    detection_enabled: Option<bool>,
+    detection_default_window_secs: Option<u64>,
+    detection_reload_interval_secs: Option<u64>,
+    // etw
+    etw_dns: Option<bool>,
+    etw_tcp: Option<bool>,
+    etw_powershell: Option<bool>,
+    etw_wmi: Option<bool>,
+    etw_schannel: Option<bool>,
+    etw_amsi: Option<bool>,
+    // agent
+    console_output: Option<bool>,
+}
+
+/// Fusionne les overrides dans le `ConfigFile` déjà parsé depuis
+/// `agent.json`. Un champ override écrase la valeur locale du même
+/// champ. Un champ override absent ne touche à rien — la valeur locale
+/// (ou le default du resolve_*) reste en place.
+fn merge_server_overrides(parsed: &mut ConfigFile, agent_json_path: &Path) {
+    let overrides_path = agent_json_path
+        .parent()
+        .map(|p| p.join("agent_config_overrides.json"))
+        .unwrap_or_else(|| PathBuf::from("agent_config_overrides.json"));
+    let bytes = match std::fs::read(&overrides_path) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let o: AgentConfigOverrides = match serde_json::from_slice(&bytes) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!(
+                "[agent] agent_config_overrides.json unreadable ({e}) — ignored"
+            );
+            return;
+        }
+    };
+
+    // Applique les overrides section par section. On instancie la
+    // section si elle était absente du `agent.json` — un override est
+    // ainsi capable d'activer une section entière (par ex. ETW).
+    let control = parsed.control.get_or_insert_with(Default::default);
+    if let Some(v) = o.heartbeat_interval_secs {
+        control.heartbeat_interval_secs = Some(v);
+    }
+    if let Some(v) = o.send_alerts {
+        control.send_alerts = Some(v);
+    }
+
+    let detection = parsed.detection.get_or_insert_with(Default::default);
+    if let Some(v) = o.detection_enabled {
+        detection.enabled = Some(v);
+    }
+    if let Some(v) = o.detection_default_window_secs {
+        detection.default_window_secs = Some(v);
+    }
+    if let Some(v) = o.detection_reload_interval_secs {
+        detection.reload_interval_secs = Some(v);
+    }
+
+    let etw = parsed.etw.get_or_insert_with(Default::default);
+    if let Some(v) = o.etw_dns {
+        etw.dns = Some(v);
+    }
+    if let Some(v) = o.etw_tcp {
+        etw.tcp = Some(v);
+    }
+    if let Some(v) = o.etw_powershell {
+        etw.powershell = Some(v);
+    }
+    if let Some(v) = o.etw_wmi {
+        etw.wmi = Some(v);
+    }
+    if let Some(v) = o.etw_schannel {
+        etw.schannel = Some(v);
+    }
+    if let Some(v) = o.etw_amsi {
+        etw.amsi = Some(v);
+    }
+
+    let agent = parsed.agent.get_or_insert_with(Default::default);
+    if let Some(v) = o.console_output {
+        agent.console_output = Some(v);
     }
 }
 
@@ -400,6 +531,13 @@ fn resolve_detection(s: DetectionSection) -> DetectionConfig {
         rules_path: non_empty(s.rules_path)
             .map(PathBuf::from)
             .unwrap_or(d.rules_path),
+        // L'empty string explicite désactive le push serveur (distinct de
+        // "absent" qui retombe sur le default).
+        server_rules_path: match s.server_rules_path {
+            None => d.server_rules_path,
+            Some(s) if s.trim().is_empty() => None,
+            Some(s) => Some(PathBuf::from(s)),
+        },
         schema_path: non_empty(s.schema_path).map(PathBuf::from),
         default_window: s
             .default_window_secs
@@ -550,8 +688,13 @@ fn write_default_config(path: &Path) -> Result<(), String> {
             "send_alerts": cc.send_alerts
         },
         "detection": {
-            "enabled": false,
+            "enabled": true,
             "rules_path": dc.rules_path.to_string_lossy(),
+            "server_rules_path": dc
+                .server_rules_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             "schema_path": "",
             "default_window_secs": dc.default_window.as_secs(),
             "reload_interval_secs": dc.reload_interval.as_secs()
