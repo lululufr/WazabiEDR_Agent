@@ -28,6 +28,20 @@ pub struct ModuleRef {
     pub version: String,
 }
 
+/// Une erreur de parse rencontrée par le moteur Waza sur une règle
+/// poussée par le serveur. Remontée à chaque heartbeat — c'est l'unique
+/// canal de feedback puisque le serveur ne valide pas avant push (cf.
+/// architecture : moteur uniquement côté agent).
+///
+/// Liste **complète** à chaque envoi : le serveur réconcilie en remplaçant
+/// l'ensemble des erreurs connues pour cet agent. Liste vide ⇒ tout
+/// parse côté agent.
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleErrorOut {
+    pub rule_name: String,
+    pub message: String,
+}
+
 /// Body of `POST /agents/{id}/heartbeat`.
 #[derive(Debug, Serialize)]
 pub struct HeartbeatRequest {
@@ -36,6 +50,10 @@ pub struct HeartbeatRequest {
     pub last_rule_version: i64,
     pub profile_version: i64,
     pub modules_loaded: Vec<ModuleRef>,
+    /// Erreurs de parse rencontrées au dernier sync de profil. Snapshot
+    /// envoyé tel quel à chaque tick — pas de delta.
+    #[serde(default)]
+    pub rule_errors: Vec<RuleErrorOut>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<serde_json::Value>,
 }
@@ -439,12 +457,18 @@ mod tests {
                 id: "m1".into(),
                 version: "1.0".into(),
             }],
+            rule_errors: vec![RuleErrorOut {
+                rule_name: "Boom".into(),
+                message: "line 2: expected ')'".into(),
+            }],
             metrics: None,
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&req).unwrap()).unwrap();
         assert_eq!(v["status"], "healthy");
         assert_eq!(v["profile_version"], 3);
         assert_eq!(v["modules_loaded"][0]["id"], "m1");
+        assert_eq!(v["rule_errors"][0]["rule_name"], "Boom");
+        assert_eq!(v["rule_errors"][0]["message"], "line 2: expected ')'");
         // metrics is None → omitted, not null (server treats it optional).
         assert!(v.get("metrics").is_none());
     }
@@ -523,6 +547,7 @@ mod tests {
             last_rule_version: 0,
             profile_version: 0,
             modules_loaded: vec![],
+            rule_errors: vec![],
             metrics: None,
         }
     }

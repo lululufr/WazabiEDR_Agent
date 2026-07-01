@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::detection::AgentAlert;
+use crate::detection::{AgentAlert, DetectionEngine};
 use crate::shutdown::SHUTDOWN;
 use client::ModuleRef;
 
@@ -65,6 +65,18 @@ pub struct ControlConfig {
     pub send_alerts: bool,
     /// Where `profile.json` / `profile_template.json` are persisted.
     pub state_dir: PathBuf,
+    /// Si défini, le control plane y écrit la concaténation des
+    /// `waza_source` du template (filtrées par `is_enabled`) à chaque
+    /// sync de profil. Le moteur recharge ensuite via `engine` (passé
+    /// juste en dessous) — il faut que le fichier `detection.rules_path`
+    /// contienne `include "./server.waza"` pour que ces règles soient
+    /// effectivement appliquées.
+    pub remote_rules_path: Option<PathBuf>,
+    /// Référence faible au moteur de détection, pour déclencher un reload
+    /// après écriture du `remote_rules_path`. `None` quand la détection
+    /// n'est pas activée — on persiste alors le template texte mais on
+    /// n'appelle pas de reload.
+    pub engine: Option<Arc<DetectionEngine>>,
 }
 
 /// In-memory profile state reported in every heartbeat, kept in sync by
@@ -73,6 +85,20 @@ pub struct ControlConfig {
 pub struct ProfileState {
     pub version: i64,
     pub modules_loaded: Vec<ModuleRef>,
+    /// Erreurs de parse rencontrées au dernier `apply_template`. Vide
+    /// quand tout parse côté agent. Remontées à chaque heartbeat pour
+    /// que la console les affiche par règle.
+    pub rule_errors: Vec<RuleError>,
+}
+
+/// Une erreur de parse côté agent, attachée à une règle nommée. Forme
+/// stable conservée entre l'écriture (sync::pull) et la lecture
+/// (heartbeat::run). Convertie en [`client::RuleErrorOut`] au moment
+/// de la sérialisation.
+#[derive(Debug, Clone)]
+pub struct RuleError {
+    pub rule_name: String,
+    pub message: String,
 }
 
 /// Counters for the end-of-run summary.
@@ -146,13 +172,23 @@ pub fn spawn_control(
     let creds = cfg.creds.clone();
     let heartbeat_interval = cfg.heartbeat_interval;
     let state_dir = cfg.state_dir.clone();
+    let remote_rules_path = cfg.remote_rules_path.clone();
+    let engine = cfg.engine.clone();
     let hb_state = Arc::clone(&state);
     let hb_stats = Arc::clone(&stats);
     let heartbeat_join = thread::Builder::new()
         .name("wedr-heartbeat".into())
         .spawn(move || {
             let client = client::Client::new(creds);
-            heartbeat::run(&client, heartbeat_interval, &state_dir, hb_state, &hb_stats);
+            heartbeat::run(
+                &client,
+                heartbeat_interval,
+                &state_dir,
+                hb_state,
+                &hb_stats,
+                remote_rules_path.as_deref(),
+                engine.as_ref(),
+            );
         })?;
 
     let alerts_join = match (cfg.send_alerts, alert_rx) {

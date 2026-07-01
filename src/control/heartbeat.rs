@@ -19,18 +19,22 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::client::{Client, HeartbeatRequest};
+use super::client::{Client, HeartbeatRequest, RuleErrorOut};
 use super::{ControlStats, ProfileState, executor, responsive_sleep, sync};
+use crate::detection::DetectionEngine;
 use crate::shutdown::SHUTDOWN;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     client: &Client,
     fallback_interval: Duration,
     state_dir: &Path,
     state: Arc<Mutex<ProfileState>>,
     stats: &ControlStats,
+    remote_rules_path: Option<&Path>,
+    engine: Option<&Arc<DetectionEngine>>,
 ) {
     eprintln!(
         "[control] heartbeat thread started — interval {}s (server may override)",
@@ -42,12 +46,20 @@ pub fn run(
     while !SHUTDOWN.load(Ordering::Acquire) {
         // Snapshot the profile state for this beat (clone to release the
         // lock before any network I/O).
-        let (profile_version, modules_loaded) = {
+        let (profile_version, modules_loaded, rule_errors) = {
             let s = match state.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            (s.version, s.modules_loaded.clone())
+            let errs = s
+                .rule_errors
+                .iter()
+                .map(|e| RuleErrorOut {
+                    rule_name: e.rule_name.clone(),
+                    message: e.message.clone(),
+                })
+                .collect();
+            (s.version, s.modules_loaded.clone(), errs)
         };
 
         let req = HeartbeatRequest {
@@ -56,6 +68,7 @@ pub fn run(
             last_rule_version: 0,
             profile_version,
             modules_loaded,
+            rule_errors,
             metrics: None,
         };
 
@@ -120,7 +133,9 @@ pub fn run(
                         if force_profile_pull { "re-pull forced" } else { "change" },
                         local, resp.current_profile_version
                     );
-                    if let Err(e) = sync::pull(client, &state, state_dir, stats) {
+                    if let Err(e) =
+                        sync::pull(client, &state, state_dir, stats, remote_rules_path, engine)
+                    {
                         eprintln!("[control] profile sync failed: {}", e);
                     }
                 }
