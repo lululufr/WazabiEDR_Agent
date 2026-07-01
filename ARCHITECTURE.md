@@ -539,6 +539,19 @@ attendre le serveur. La détection est pilotée par des fichiers de **règles** 
 petit langage maison, **Waza** (extension `.waza`). Le code est dans
 [`src/detection/`](src/detection/).
 
+> **Référence de grammaire** : [`doc/reference/waza-rules.md`](doc/reference/waza-rules.md)
+> (sections, opérateurs, throttle, mode déconnecté, exemples).
+
+> **Note d'organisation** : depuis la mise en place de l'éditeur web côté console,
+> le parser / AST / engine vivent dans un crate frère `wedr-waza-core`
+> (`../WazabiEDR_WazaCore/`). Le moteur est ainsi partagé entre l'agent (qui
+> hot-reload des fichiers `.waza`) et le binaire `wedr-waza-check`
+> (`WazabiEDR_Utils`) que le serveur invoque pour valider / simuler / lister
+> le schéma. Une seule implémentation de la grammaire, pas de risque de
+> dérive parser-serveur ↔ moteur-agent. Le module `src/detection/` ne
+> contient plus que la *façade* (`DetectionEngine`), l'exécuteur d'actions
+> et le pont d'alerte vers le control plane.
+
 C'est une fonctionnalité **opt-in** (« par adhésion » : désactivée par défaut, il faut
 l'activer explicitement dans la config, §8). Désactivée, l'agent se comporte exactement
 comme avant son ajout, sans aucun surcoût.
