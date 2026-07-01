@@ -8,6 +8,13 @@
 //! run via [`actions::execute`]. No module field name is known at compile
 //! time.
 //!
+//! Since `wedr-waza-core` was split out, the parser / AST / engine /
+//! schema live in that sibling crate (so the server can validate +
+//! simulate rules without duplicating Rust code). The module paths
+//! `detection::event`, `detection::schema`, `detection::waza::{ast,
+//! engine, parser}` are kept here as re-exports so the rest of the agent
+//! (kernel pump, plugin server, control plane) doesn't need to change.
+//!
 //! This module owns the *facade* the rest of the agent talks to:
 //! [`DetectionEngine`] hides the thread-safe sharing and hot-reload of
 //! the rule set behind a single `process()` entry point, mirroring the
@@ -15,12 +22,18 @@
 //! (`RwLock<Arc<…>>` + a polling reload thread).
 
 pub mod actions;
-pub mod event;
-pub mod schema;
+
+/// Re-export of `wedr_waza_core::event` so call sites can keep using
+/// `crate::detection::event::LogEvent`.
+pub use wedr_waza_core::event;
+/// Re-export of `wedr_waza_core::schema` (validation registry).
+pub use wedr_waza_core::schema;
+/// Re-export of the core engine modules under the historical
+/// `crate::detection::waza::*` path.
 pub mod waza {
-    pub mod ast;
-    pub mod engine;
-    pub mod parser;
+    pub use wedr_waza_core::ast;
+    pub use wedr_waza_core::engine;
+    pub use wedr_waza_core::parser;
 }
 
 use std::path::{Path, PathBuf};
@@ -127,6 +140,12 @@ impl DetectionEngine {
     /// caller treats that as "detection disabled" and the rest of the
     /// agent starts normally. A missing/unreadable schema file is a
     /// soft warning (validation skipped), never fatal.
+    ///
+    /// Si le fichier `rules_path` n'existe pas, on l'auto-crée avec un
+    /// squelette qui inclut `server.waza`. Ainsi la détection est utile
+    /// dès le premier boot : dès que le serveur pousse un template, la
+    /// règle apparaît. Sans ça, `detection.enabled=true` par défaut mais
+    /// pas de fichier = load échoue → détection off en pratique.
     pub fn load(
         rules_path: &Path,
         schema_path: Option<&Path>,
@@ -135,6 +154,15 @@ impl DetectionEngine {
         let schema = SchemaRegistry::new();
         if let Some(sp) = schema_path {
             load_schema_into(&schema, sp);
+        }
+
+        if !rules_path.exists() {
+            if let Err(e) = bootstrap_rules_file(rules_path) {
+                eprintln!(
+                    "[waza] rules file {} absent, bootstrap failed: {e}",
+                    rules_path.display()
+                );
+            }
         }
 
         let rules = waza::parser::parse_file_with_window(rules_path, default_window)?;
@@ -232,6 +260,14 @@ impl DetectionEngine {
         let _ = tx.try_send(alert);
     }
 
+    /// Force an immediate reload from disk. Used by the control plane
+    /// after writing a fresh `server.waza` so the operator's expectation
+    /// of "click save → applied within a heartbeat" holds, without
+    /// waiting for the next mtime poll.
+    pub fn force_reload(&self) -> Result<(), String> {
+        self.reload()
+    }
+
     /// Re-parse the rules file and atomically swap the engine. On parse
     /// failure the previous engine is kept (better stale than empty).
     /// Note: correlation windows reset on reload (fresh engine) — an
@@ -248,6 +284,46 @@ impl DetectionEngine {
         eprintln!("[waza] rules reloaded — {} rule(s)", count);
         Ok(())
     }
+}
+
+/// Écrit un `.waza` minimal au premier démarrage. Le fichier contient
+/// juste un include du `server.waza` sibling — sans include, les règles
+/// poussées par le serveur (écrites dans `server.waza` par la sync
+/// profil) ne seraient pas prises en compte par le moteur. Une règle
+/// bidon `_bootstrap` sert à contenter le parser (Detection sans Action
+/// = parse error depuis le fix récent).
+fn bootstrap_rules_file(rules_path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = rules_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Le `server.waza` frère est aussi créé vide : il n'est écrit par
+    // sync::pull qu'au premier heartbeat suivant, or `include` refuse
+    // un chemin inexistant.
+    if let Some(parent) = rules_path.parent() {
+        let server = parent.join("server.waza");
+        if !server.exists() {
+            std::fs::write(&server, "")?;
+        }
+    }
+    let content = r#"# Fichier maître des règles — auto-généré au premier démarrage.
+# Les règles poussées par le serveur arrivent dans ./server.waza et
+# sont chargées via l'include ci-dessous. Ajoute ici tes règles locales.
+
+- Detection:
+  - _bootstrap:
+      - kernel_callback.process_create.pid > 0
+  - include "./server.waza"
+
+- Action:
+  - _bootstrap:
+    - log
+"#;
+    std::fs::write(rules_path, content)?;
+    eprintln!(
+        "[waza] bootstrapped default rules file {}",
+        rules_path.display()
+    );
+    Ok(())
 }
 
 /// Load + register schema declarations from a JSON file. Best-effort:

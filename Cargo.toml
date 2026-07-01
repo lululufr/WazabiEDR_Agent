@@ -60,6 +60,16 @@ ferrisetw = "1.2"
 # Production posture is the service path; dev runs are usually console.
 windows-service = "0.7"
 
+# Pure rule engine (.waza DSL parser, AST, evaluator). Vit dans un
+# repo séparé (github.com/lululufr/WazabiEDR_WazaCore) pour être
+# consommé aussi par WazabiEDR_Utils/wedr-waza-check.
+#
+# Dev local (patch le remote vers le dossier sibling) — mettre dans
+# `.cargo/config.toml` GITIGNORÉ :
+#   [patch."https://github.com/lululufr/WazabiEDR_WazaCore.git"]
+#   wedr-waza-core = { path = "../WazabiEDR_WazaCore" }
+wedr-waza-core = { git = "https://github.com/lululufr/WazabiEDR_WazaCore.git", tag = "v0.1.0" }
+
 # Smaller, faster, no-debug-info release builds. `panic = "abort"` keeps
 # us in line with the driver's panic policy and removes the unwinding
 # tables; `lto = "thin"` and `codegen-units = 1` give the linker the
